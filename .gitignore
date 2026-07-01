@@ -1,0 +1,19 @@
+# Secrets
+.env
+
+# Virtual environments
+venv/
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local tool config (not part of the project)
+.claude/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
