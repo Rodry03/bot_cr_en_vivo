@@ -129,7 +129,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def handle_press_release(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Treats any non-command text message as a press release and generates a copy draft."""
     press_release = update.message.text
-    status_msg = await update.message.reply_text("⏳ Generando copy…")
+    status_msg = await update.message.reply_text("📨 Nota de prensa recibida…")
     await generate_and_show_draft(status_msg, context, press_release)
 
 
