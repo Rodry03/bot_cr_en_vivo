@@ -305,10 +305,57 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.message.delete()
 
 
+def setup_langfuse_tracing() -> None:
+    """Activa el tracing de Langfuse para las llamadas a Groq y Gemini.
+
+    Instrumentación NO invasiva: parchea los SDKs de Groq y google-genai a nivel de
+    cliente (vía OpenInference), así que generate_copy() y describe_poster_image()
+    no se tocan. Cualquier fallo aquí (credenciales ausentes/erróneas, red, host mal
+    configurado...) se registra en el log y el bot sigue funcionando sin observabilidad.
+    """
+    if not os.environ.get("LANGFUSE_PUBLIC_KEY") or not os.environ.get("LANGFUSE_SECRET_KEY"):
+        logger.info(
+            "Langfuse: LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY no configuradas. "
+            "Tracing desactivado, el bot funciona igual."
+        )
+        return
+
+    try:
+        from langfuse import get_client
+        from openinference.instrumentation import TraceConfig
+        from openinference.instrumentation.google_genai import GoogleGenAIInstrumentor
+        from openinference.instrumentation.groq import GroqInstrumentor
+
+        langfuse = get_client()
+        GroqInstrumentor().instrument()
+        # hide_input_images: las fotos de carteles superan el límite de base64 que
+        # Langfuse intenta decodificar como media, lo que solo generaba un log de error
+        # inofensivo. No hace falta ver la imagen en la traza (basta con el texto/modelo/
+        # tokens/coste), así que se oculta en origen en vez de dejar el ruido en el log.
+        GoogleGenAIInstrumentor().instrument(config=TraceConfig(hide_input_images=True))
+
+        if langfuse.auth_check():
+            logger.info("Langfuse: tracing activo (Groq + Gemini instrumentados).")
+        else:
+            logger.warning(
+                "Langfuse: no se pudo autenticar con las credenciales/host configurados "
+                "(revisa LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY/LANGFUSE_HOST). "
+                "El bot sigue funcionando pero no se enviarán trazas."
+            )
+    except Exception as exc:
+        logger.warning(
+            "Langfuse: no se pudo inicializar el tracing (%s). "
+            "El bot sigue funcionando sin observabilidad.",
+            exc,
+        )
+
+
 def main() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         raise ValueError("TELEGRAM_BOT_TOKEN no está definido en el archivo .env")
+
+    setup_langfuse_tracing()
 
     app = Application.builder().token(token).build()
 
