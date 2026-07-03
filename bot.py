@@ -8,6 +8,8 @@ from pathlib import Path
 import pdfplumber
 from docx import Document
 from dotenv import load_dotenv
+from google import genai
+from google.genai import types as genai_types
 from groq import AsyncGroq
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -48,7 +50,24 @@ COPY_SYSTEM_PROMPT = load_copy_system_prompt()
 
 # ─────────────────────────────────────────────────────────────────────────────
 
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL = "openai/gpt-oss-120b"
+
+# Modelo de visión de Gemini usado para "leer" carteles de eventos en fotos.
+# Solo describe la imagen en texto neutro; la voz del copy la pone Groq (ver generate_copy).
+GEMINI_VISION_MODEL = "gemini-2.5-flash"
+
+GEMINI_VISION_PROMPT = """Eres un transcriptor neutro de carteles/imágenes de eventos.
+
+Describe en texto plano y ordenado TODOS los datos textuales que aparezcan en la imagen: \
+qué evento es, fecha, hora, lugar, organizador, teléfonos, precios, plazas, edad mínima/requisitos \
+y cualquier otro dato concreto visible.
+
+Reglas estrictas:
+- No inventes ni completes datos que no estén escritos en la imagen.
+- No omitas ningún dato relevante que sí aparezca.
+- No redactes un copy ni le des estilo o tono: solo transcribe/describe la información de forma \
+neutra y estructurada, como si fuera una ficha de datos.
+- Si algún dato no es legible o no aparece, simplemente no lo incluyas (no lo rellenes)."""
 
 DRAFT_KEYBOARD = InlineKeyboardMarkup([
     [
@@ -72,6 +91,19 @@ async def generate_copy(press_release: str, temperature: float = 0.7) -> str:
         max_tokens=1024,
     )
     return response.choices[0].message.content.strip()
+
+
+def describe_poster_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> str:
+    """Calls Gemini Vision to transcribe a poster image into plain, neutral text. Runs synchronously."""
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    response = client.models.generate_content(
+        model=GEMINI_VISION_MODEL,
+        contents=[
+            genai_types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+            GEMINI_VISION_PROMPT,
+        ],
+    )
+    return (response.text or "").strip()
 
 
 def extract_text_from_pdf(path: str) -> str:
@@ -179,6 +211,52 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await generate_and_show_draft(status_msg, context, text)
 
 
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Treats a photo (event poster) as a press release: describes it via Gemini Vision and generates a copy draft."""
+    status_msg = await update.message.reply_text("🖼️ Descargando imagen…")
+
+    try:
+        photo = update.message.photo[-1]  # última = mayor resolución
+        tg_file = await photo.get_file()
+        image_bytes = bytes(await tg_file.download_as_bytearray())
+    except Exception as exc:
+        logger.error("Error al descargar la foto: %s", exc)
+        await status_msg.edit_text(
+            "❌ No se pudo descargar la imagen. Inténtalo de nuevo."
+        )
+        return
+
+    await status_msg.edit_text("🔎 Leyendo el cartel…")
+
+    loop = asyncio.get_running_loop()
+    try:
+        description = await loop.run_in_executor(
+            None, describe_poster_image, image_bytes
+        )
+    except Exception as exc:
+        logger.error(
+            "Error al llamar a Gemini Vision (modelo=%s). Si el mensaje menciona "
+            "'region', 'location', 'billing' o 'PERMISSION_DENIED', probablemente sea "
+            "un bloqueo de disponibilidad regional o de facturación (común en la UE): %s",
+            GEMINI_VISION_MODEL,
+            exc,
+        )
+        await status_msg.edit_text(
+            "❌ No he podido procesar la imagen ahora mismo. Inténtalo de nuevo en unos minutos."
+        )
+        return
+
+    description = description.strip()
+    if not description:
+        await status_msg.edit_text(
+            "⚠️ No pude extraer información del cartel. Prueba con una foto más nítida "
+            "o pega el texto directamente."
+        )
+        return
+
+    await generate_and_show_draft(status_msg, context, description)
+
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handles the approve / regenerate / discard inline button callbacks."""
     query = update.callback_query
@@ -237,6 +315,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_press_release))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
     logger.info("Bot arrancado. Escuchando mensajes (long-polling)…")
