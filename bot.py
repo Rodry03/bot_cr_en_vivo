@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import html
 import json
 import logging
@@ -63,6 +64,12 @@ TONE_DISPLAY = {
     "politico": "político",
     "mejora": "mejora",
 }
+
+# Modelo de Whisper en Groq usado para transcribir notas de voz reenviadas (mp4/m4a/mp3/ogg/wav).
+# Groq acepta estos contenedores directamente, así que no hace falta reextraer el audio con
+# ffmpeg antes de subirlo (confirmado en la documentación de Groq y probado en vivo).
+WHISPER_MODEL = "whisper-large-v3"
+AUDIO_EXTENSIONS = {".mp4", ".m4a", ".mp3", ".ogg", ".wav"}
 
 # Modelo de visión de Gemini usado para "leer" carteles de eventos en fotos.
 # Solo describe la imagen en texto neutro; la voz del copy la pone Groq (ver generate_copy).
@@ -152,6 +159,45 @@ def extract_text_from_docx(path: str) -> str:
     return "\n".join(paragraph.text for paragraph in document.paragraphs)
 
 
+def _langfuse_transcription_span():
+    """Best-effort manual Langfuse span for the Whisper call.
+
+    GroqInstrumentor (openinference-instrumentation-groq) solo parchea chat.completions,
+    no audio.transcriptions, así que aquí no hay instrumentación automática. Si Langfuse
+    no está configurado o falla, se devuelve un context manager que no hace nada.
+    """
+    try:
+        from langfuse import get_client
+
+        return get_client().start_as_current_observation(
+            name="groq-whisper-transcription",
+            as_type="generation",
+            model=WHISPER_MODEL,
+        )
+    except Exception:
+        return contextlib.nullcontext()
+
+
+async def transcribe_audio(file_path: str) -> str:
+    """Calls Groq Whisper to transcribe an audio file into plain Spanish text."""
+    client = AsyncGroq(api_key=os.environ["GROQ_API_KEY"])
+    with open(file_path, "rb") as f:
+        file_bytes = f.read()
+
+    with _langfuse_transcription_span() as span:
+        text = await client.audio.transcriptions.create(
+            model=WHISPER_MODEL,
+            file=(os.path.basename(file_path), file_bytes),
+            language="es",
+            response_format="text",
+        )
+        if span is not None and hasattr(span, "update"):
+            with contextlib.suppress(Exception):
+                span.update(output=text)
+
+    return text.strip()
+
+
 async def generate_and_show_draft(
     status_msg, context: ContextTypes.DEFAULT_TYPE, press_release: str
 ) -> None:
@@ -203,13 +249,23 @@ async def handle_press_release(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Treats an attached PDF/DOCX as a press release: extracts its text and generates a copy draft."""
+    """Treats an attached PDF/DOCX/audio as a press release: extracts or transcribes its content and generates a copy draft."""
     document = update.message.document
     file_name = document.file_name or ""
     ext = Path(file_name).suffix.lower()
+    mime_type = document.mime_type or ""
+    is_audio = (
+        ext in AUDIO_EXTENSIONS
+        or mime_type.startswith("audio/")
+        or mime_type == "video/mp4"
+    )
+
+    if is_audio:
+        await handle_audio_document(update, context, document, ext)
+        return
 
     if ext not in (".pdf", ".docx"):
-        await update.message.reply_text("De momento solo acepto pdf o docx.")
+        await update.message.reply_text("De momento solo acepto pdf, docx o audio (nota de voz reenviada).")
         return
 
     status_msg = await update.message.reply_text("⏳ Descargando documento…")
@@ -242,6 +298,42 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await status_msg.edit_text(
             "⚠️ No encontré texto en ese documento. Si es un PDF escaneado (solo imagen), "
             "de momento no puedo leerlo — pega el texto directamente."
+        )
+        return
+
+    await generate_and_show_draft(status_msg, context, text)
+
+
+async def handle_audio_document(update: Update, context: ContextTypes.DEFAULT_TYPE, document, ext: str) -> None:
+    """Treats an attached audio file (mp4/m4a/mp3/ogg/wav) as a press release: transcribes it with Groq Whisper and generates a copy draft."""
+    status_msg = await update.message.reply_text("🎙️ Descargando audio…")
+
+    tmp_path = None
+    try:
+        tg_file = await document.get_file()
+        with tempfile.NamedTemporaryFile(suffix=ext or ".mp4", delete=False) as tmp:
+            tmp_path = tmp.name
+        await tg_file.download_to_drive(tmp_path)
+
+        await status_msg.edit_text("⏳ Transcribiendo audio… puede tardar unos segundos")
+        text = await transcribe_audio(tmp_path)
+    except Exception as exc:
+        logger.error("Error al transcribir el audio: %s", exc)
+        await status_msg.edit_text(
+            "❌ No he podido transcribir el audio. Prueba a reenviarlo de nuevo o mándame el texto directamente."
+        )
+        return
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+    text = text.strip()
+    if not text:
+        await status_msg.edit_text(
+            "⚠️ No he detectado voz en ese audio. Prueba con otro archivo o pega el texto directamente."
         )
         return
 
