@@ -1,5 +1,6 @@
 import asyncio
 import html
+import json
 import logging
 import os
 import tempfile
@@ -52,6 +53,17 @@ COPY_SYSTEM_PROMPT = load_copy_system_prompt()
 
 GROQ_MODEL = "openai/gpt-oss-120b"
 
+# Registros de tono que copy_prompt.txt puede detectar (ver bloque "ANTES DE ESCRIBIR" ahí).
+DEFAULT_TONE = "festivo"
+ALLOWED_TONES = {"festivo", "sobrio", "alerta", "politico", "mejora"}
+TONE_DISPLAY = {
+    "festivo": "festivo",
+    "sobrio": "sobrio",
+    "alerta": "alerta",
+    "politico": "político",
+    "mejora": "mejora",
+}
+
 # Modelo de visión de Gemini usado para "leer" carteles de eventos en fotos.
 # Solo describe la imagen en texto neutro; la voz del copy la pone Groq (ver generate_copy).
 GEMINI_VISION_MODEL = "gemini-2.5-flash"
@@ -78,8 +90,13 @@ DRAFT_KEYBOARD = InlineKeyboardMarkup([
 ])
 
 
-async def generate_copy(press_release: str, temperature: float = 0.7) -> str:
-    """Calls Groq to generate an Instagram copy from the given press release text."""
+async def generate_copy(press_release: str, temperature: float = 0.7) -> tuple[str, str]:
+    """Calls Groq to generate an Instagram copy and detect its tone from the press release text.
+
+    Returns (copy, tono), donde tono es uno de ALLOWED_TONES. Si el modelo no devuelve
+    un JSON válido con esas claves, se hace fallback a (texto_crudo, DEFAULT_TONE) para
+    que el bot nunca se rompa por esto.
+    """
     client = AsyncGroq(api_key=os.environ["GROQ_API_KEY"])
     response = await client.chat.completions.create(
         model=GROQ_MODEL,
@@ -89,8 +106,25 @@ async def generate_copy(press_release: str, temperature: float = 0.7) -> str:
         ],
         temperature=temperature,
         max_tokens=1024,
+        response_format={"type": "json_object"},
     )
-    return response.choices[0].message.content.strip()
+    raw = response.choices[0].message.content.strip()
+
+    try:
+        data = json.loads(raw)
+        copy_text = str(data["copy"]).strip()
+        if not copy_text:
+            raise ValueError("la clave 'copy' del JSON viene vacía")
+        tone = str(data.get("tono", "")).strip().lower()
+        if tone not in ALLOWED_TONES:
+            tone = DEFAULT_TONE
+        return copy_text, tone
+    except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
+        logger.warning(
+            "Groq no devolvió el JSON {tono, copy} esperado, uso el texto en crudo y tono por defecto: %s",
+            exc,
+        )
+        return raw, DEFAULT_TONE
 
 
 def describe_poster_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> str:
@@ -127,7 +161,7 @@ async def generate_and_show_draft(
     await status_msg.edit_text("⏳ Generando copy…")
 
     try:
-        draft = await generate_copy(press_release)
+        draft, tone = await generate_copy(press_release)
     except Exception as exc:
         logger.error("Error al llamar a Groq: %s", exc)
         await status_msg.edit_text(
@@ -138,9 +172,12 @@ async def generate_and_show_draft(
         return
 
     context.user_data["current_draft"] = draft
+    context.user_data["current_tone"] = tone
 
     await status_msg.edit_text(
-        f"📝 <b>Borrador de copy:</b>\n\n{html.escape(draft)}",
+        f"📝 <b>Borrador de copy:</b>\n"
+        f"Tono detectado: <b>{TONE_DISPLAY[tone]}</b>\n\n"
+        f"<pre>{html.escape(draft)}</pre>",
         reply_markup=DRAFT_KEYBOARD,
         parse_mode="HTML",
     )
@@ -266,8 +303,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if action == "approve":
         draft = context.user_data.get("current_draft", "")
+        tone = context.user_data.get("current_tone", DEFAULT_TONE)
         await query.edit_message_text(
-            f"✅ <b>Copy aprobado</b>\n\n{html.escape(draft)}",
+            f"✅ <b>Copy aprobado</b>\n"
+            f"Tono detectado: <b>{TONE_DISPLAY[tone]}</b>\n\n"
+            f"<pre>{html.escape(draft)}</pre>",
             parse_mode="HTML",
         )
 
@@ -285,7 +325,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         try:
             # Slightly higher temperature so the new draft varies from the previous one
-            draft = await generate_copy(press_release, temperature=0.9)
+            draft, tone = await generate_copy(press_release, temperature=0.9)
         except Exception as exc:
             logger.error("Error al regenerar con Groq: %s", exc)
             await query.edit_message_text(
@@ -294,9 +334,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
 
         context.user_data["current_draft"] = draft
+        context.user_data["current_tone"] = tone
 
         await query.edit_message_text(
-            f"📝 <b>Borrador de copy:</b>\n\n{html.escape(draft)}",
+            f"📝 <b>Borrador de copy:</b>\n"
+            f"Tono detectado: <b>{TONE_DISPLAY[tone]}</b>\n\n"
+            f"<pre>{html.escape(draft)}</pre>",
             reply_markup=DRAFT_KEYBOARD,
             parse_mode="HTML",
         )
