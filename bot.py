@@ -12,7 +12,7 @@ from docx import Document
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
-from groq import AsyncGroq
+from groq import APIStatusError, AsyncGroq
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
@@ -97,6 +97,19 @@ DRAFT_KEYBOARD = InlineKeyboardMarkup([
 ])
 
 
+DOCUMENT_TOO_LONG_MESSAGE = (
+    "⚠️ El documento es demasiado largo para procesarlo de una vez. "
+    "Prueba a mandarme solo la parte relevante, o un documento más corto."
+)
+
+
+def is_document_too_long_error(exc: Exception) -> bool:
+    """Detects Groq's 413 'request too large' error (texto + prompt exceden el límite
+    de tokens por request/minuto), a distinguir del 429 genérico de rate limiting
+    (ese sí es transitorio y no tiene que ver con el tamaño del documento)."""
+    return isinstance(exc, APIStatusError) and exc.status_code == 413
+
+
 async def generate_copy(press_release: str, temperature: float = 0.7) -> tuple[str, str]:
     """Calls Groq to generate an Instagram copy and detect its tone from the press release text.
 
@@ -147,10 +160,25 @@ def describe_poster_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> 
     return (response.text or "").strip()
 
 
-def extract_text_from_pdf(path: str) -> str:
-    """Extracts and concatenates the text of every page of a PDF. Runs synchronously."""
+PDF_MAX_PAGES = 5
+PDF_TRUNCATED_NOTICE = (
+    "ℹ️ El documento tenía más de 5 páginas; he usado solo las primeras 5 "
+    "para generar el copy."
+)
+
+
+def extract_text_from_pdf(path: str) -> tuple[str, bool]:
+    """Extracts and concatenates the text of the first PDF_MAX_PAGES pages of a PDF. Runs synchronously.
+
+    Trunca a las primeras PDF_MAX_PAGES páginas como heurística para reducir el riesgo de
+    pasarse del límite de tokens de Groq (ver DOCUMENT_TOO_LONG_MESSAGE, que sigue siendo
+    la red de seguridad si aun así se supera). Devuelve (texto, truncado).
+    """
     with pdfplumber.open(path) as pdf:
-        return "\n".join(page.extract_text() or "" for page in pdf.pages)
+        pages = pdf.pages[:PDF_MAX_PAGES]
+        truncated = len(pdf.pages) > PDF_MAX_PAGES
+        text = "\n".join(page.extract_text() or "" for page in pages)
+        return text, truncated
 
 
 def extract_text_from_docx(path: str) -> str:
@@ -199,29 +227,32 @@ async def transcribe_audio(file_path: str) -> str:
 
 
 async def handle_extracted_text(
-    status_msg, context: ContextTypes.DEFAULT_TYPE, text: str
+    status_msg, context: ContextTypes.DEFAULT_TYPE, text: str, notice: str = ""
 ) -> None:
     """Routes freshly extracted text (from any input type) to the normal draft flow,
-    or to the multi-fuente accumulator if that mode is active for this chat."""
+    or to the multi-fuente accumulator if that mode is active for this chat.
+
+    notice, si se pasa (p. ej. PDF_TRUNCATED_NOTICE), se muestra junto al resultado."""
     if context.user_data.get("multi_mode"):
-        await accumulate_multi_source(status_msg, context, text)
+        await accumulate_multi_source(status_msg, context, text, notice=notice)
     else:
-        await generate_and_show_draft(status_msg, context, text)
+        await generate_and_show_draft(status_msg, context, text, notice=notice)
 
 
 async def accumulate_multi_source(
-    status_msg, context: ContextTypes.DEFAULT_TYPE, text: str
+    status_msg, context: ContextTypes.DEFAULT_TYPE, text: str, notice: str = ""
 ) -> None:
     """Stores one extracted source while modo multi-fuente is active, instead of generating a copy."""
     sources = context.user_data.setdefault("multi_sources", [])
     sources.append(text)
-    await status_msg.edit_text(
-        f"✅ Fuente {len(sources)} guardada. Mándame más fuentes o pulsa /generar."
-    )
+    message = f"✅ Fuente {len(sources)} guardada. Mándame más fuentes o pulsa /generar."
+    if notice:
+        message += f"\n\n{notice}"
+    await status_msg.edit_text(message)
 
 
 async def generate_and_show_draft(
-    status_msg, context: ContextTypes.DEFAULT_TYPE, press_release: str
+    status_msg, context: ContextTypes.DEFAULT_TYPE, press_release: str, notice: str = ""
 ) -> None:
     """Generates a copy from the press release text and shows it with the approve/regenerate/discard buttons."""
     context.user_data["press_release"] = press_release
@@ -231,6 +262,10 @@ async def generate_and_show_draft(
     try:
         draft, tone = await generate_copy(press_release)
     except Exception as exc:
+        if is_document_too_long_error(exc):
+            logger.warning("Documento demasiado largo para Groq (413): %s", exc)
+            await status_msg.edit_text(DOCUMENT_TOO_LONG_MESSAGE)
+            return
         logger.error("Error al llamar a Groq: %s", exc)
         await status_msg.edit_text(
             "❌ No se pudo generar el copy. "
@@ -242,10 +277,16 @@ async def generate_and_show_draft(
     context.user_data["current_draft"] = draft
     context.user_data["current_tone"] = tone
 
-    await status_msg.edit_text(
+    message = (
         f"📝 <b>Borrador de copy:</b>\n"
         f"Tono detectado: <b>{TONE_DISPLAY[tone]}</b>\n\n"
-        f"<pre>{html.escape(draft)}</pre>",
+        f"<pre>{html.escape(draft)}</pre>"
+    )
+    if notice:
+        message += f"\n\n{html.escape(notice)}"
+
+    await status_msg.edit_text(
+        message,
         reply_markup=DRAFT_KEYBOARD,
         parse_mode="HTML",
     )
@@ -297,7 +338,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     status_msg = await update.message.reply_text("⏳ Descargando documento…")
 
     try:
-        text = await extract_text_from_pdf_or_docx_document(document, ext)
+        text, truncated = await extract_text_from_pdf_or_docx_document(document, ext)
     except Exception as exc:
         logger.error("Error al leer el documento: %s", exc)
         await status_msg.edit_text(
@@ -313,11 +354,16 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    await handle_extracted_text(status_msg, context, text)
+    notice = PDF_TRUNCATED_NOTICE if truncated else ""
+    await handle_extracted_text(status_msg, context, text, notice=notice)
 
 
-async def extract_text_from_pdf_or_docx_document(document, ext: str) -> str:
-    """Downloads a Telegram PDF/DOCX document and extracts its text, reusing the existing extractors."""
+async def extract_text_from_pdf_or_docx_document(document, ext: str) -> tuple[str, bool]:
+    """Downloads a Telegram PDF/DOCX document and extracts its text, reusing the existing extractors.
+
+    Devuelve (texto, truncado). truncado solo puede ser True para PDF (ver PDF_MAX_PAGES);
+    DOCX se extrae siempre completo.
+    """
     tmp_path = None
     try:
         tg_file = await document.get_file()
@@ -326,8 +372,10 @@ async def extract_text_from_pdf_or_docx_document(document, ext: str) -> str:
         await tg_file.download_to_drive(tmp_path)
 
         loop = asyncio.get_running_loop()
-        extractor = extract_text_from_pdf if ext == ".pdf" else extract_text_from_docx
-        return await loop.run_in_executor(None, extractor, tmp_path)
+        if ext == ".pdf":
+            return await loop.run_in_executor(None, extract_text_from_pdf, tmp_path)
+        text = await loop.run_in_executor(None, extract_text_from_docx, tmp_path)
+        return text, False
     finally:
         if tmp_path:
             try:
@@ -524,6 +572,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             # Slightly higher temperature so the new draft varies from the previous one
             draft, tone = await generate_copy(press_release, temperature=0.9)
         except Exception as exc:
+            if is_document_too_long_error(exc):
+                logger.warning("Documento demasiado largo para Groq (413): %s", exc)
+                await query.edit_message_text(DOCUMENT_TOO_LONG_MESSAGE)
+                return
             logger.error("Error al regenerar con Groq: %s", exc)
             await query.edit_message_text(
                 "❌ No se pudo regenerar el copy. Inténtalo de nuevo."
