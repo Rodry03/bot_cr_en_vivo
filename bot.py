@@ -198,6 +198,28 @@ async def transcribe_audio(file_path: str) -> str:
     return text.strip()
 
 
+async def handle_extracted_text(
+    status_msg, context: ContextTypes.DEFAULT_TYPE, text: str
+) -> None:
+    """Routes freshly extracted text (from any input type) to the normal draft flow,
+    or to the multi-fuente accumulator if that mode is active for this chat."""
+    if context.user_data.get("multi_mode"):
+        await accumulate_multi_source(status_msg, context, text)
+    else:
+        await generate_and_show_draft(status_msg, context, text)
+
+
+async def accumulate_multi_source(
+    status_msg, context: ContextTypes.DEFAULT_TYPE, text: str
+) -> None:
+    """Stores one extracted source while modo multi-fuente is active, instead of generating a copy."""
+    sources = context.user_data.setdefault("multi_sources", [])
+    sources.append(text)
+    await status_msg.edit_text(
+        f"✅ Fuente {len(sources)} guardada. Mándame más fuentes o pulsa /generar."
+    )
+
+
 async def generate_and_show_draft(
     status_msg, context: ContextTypes.DEFAULT_TYPE, press_release: str
 ) -> None:
@@ -236,16 +258,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Pégame una nota de prensa (o mándamela como PDF/DOCX) y te la convierto "
         "en un copy listo para Instagram.\n\n"
         "Podrás <b>aprobar</b> el borrador, pedir una <b>variante</b> o <b>descartarlo</b> "
-        "con los botones que aparecerán bajo cada copy.",
+        "con los botones que aparecerán bajo cada copy.\n\n"
+        "Si una noticia tiene varias fuentes (p. ej. nota del gobierno + comunicado de la "
+        "oposición), usa /multi para acumularlas y /generar para hacer un único copy que las "
+        "contraste (o /cancelar para descartarlo).",
         parse_mode="HTML",
     )
 
 
 async def handle_press_release(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Treats any non-command text message as a press release and generates a copy draft."""
+    """Treats any non-command text message as a press release and generates a copy draft
+    (or accumulates it as a source if modo multi-fuente está activo)."""
     press_release = update.message.text
     status_msg = await update.message.reply_text("📨 Nota de prensa recibida…")
-    await generate_and_show_draft(status_msg, context, press_release)
+    await handle_extracted_text(status_msg, context, press_release)
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -270,28 +296,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     status_msg = await update.message.reply_text("⏳ Descargando documento…")
 
-    tmp_path = None
     try:
-        tg_file = await document.get_file()
-        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
-            tmp_path = tmp.name
-        await tg_file.download_to_drive(tmp_path)
-
-        loop = asyncio.get_running_loop()
-        extractor = extract_text_from_pdf if ext == ".pdf" else extract_text_from_docx
-        text = await loop.run_in_executor(None, extractor, tmp_path)
+        text = await extract_text_from_pdf_or_docx_document(document, ext)
     except Exception as exc:
         logger.error("Error al leer el documento: %s", exc)
         await status_msg.edit_text(
             "❌ No se pudo leer el documento. Comprueba que no esté dañado e inténtalo de nuevo."
         )
         return
-    finally:
-        if tmp_path:
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
 
     text = text.strip()
     if not text:
@@ -301,7 +313,27 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    await generate_and_show_draft(status_msg, context, text)
+    await handle_extracted_text(status_msg, context, text)
+
+
+async def extract_text_from_pdf_or_docx_document(document, ext: str) -> str:
+    """Downloads a Telegram PDF/DOCX document and extracts its text, reusing the existing extractors."""
+    tmp_path = None
+    try:
+        tg_file = await document.get_file()
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+            tmp_path = tmp.name
+        await tg_file.download_to_drive(tmp_path)
+
+        loop = asyncio.get_running_loop()
+        extractor = extract_text_from_pdf if ext == ".pdf" else extract_text_from_docx
+        return await loop.run_in_executor(None, extractor, tmp_path)
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 async def handle_audio_document(update: Update, context: ContextTypes.DEFAULT_TYPE, document, ext: str) -> None:
@@ -337,7 +369,7 @@ async def handle_audio_document(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
 
-    await generate_and_show_draft(status_msg, context, text)
+    await handle_extracted_text(status_msg, context, text)
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -383,7 +415,80 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
-    await generate_and_show_draft(status_msg, context, description)
+    await handle_extracted_text(status_msg, context, description)
+
+
+async def multi_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles /multi: activates modo multi-fuente, or reports the current progress if already active."""
+    if context.user_data.get("multi_mode"):
+        n = len(context.user_data.get("multi_sources", []))
+        await update.message.reply_text(
+            f"ℹ️ Ya estás en modo multi-fuente, con {n} fuente(s) acumulada(s). "
+            "Mándame más fuentes, o pulsa /generar o /cancelar."
+        )
+        return
+
+    context.user_data["multi_mode"] = True
+    context.user_data["multi_sources"] = []
+    await update.message.reply_text(
+        "🗂️ <b>Modo multi-fuente activado.</b>\n"
+        "Mándame las fuentes una a una (texto, PDF, DOCX, foto o audio). "
+        "Cuando las tengas todas, pulsa /generar para juntarlas en un solo copy, "
+        "o /cancelar para descartarlas.",
+        parse_mode="HTML",
+    )
+
+
+async def multi_generate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles /generar: combines all accumulated sources into one press release and generates a single copy."""
+    if not context.user_data.get("multi_mode"):
+        await update.message.reply_text(
+            "ℹ️ No estás en modo multi-fuente. Actívalo con /multi si quieres combinar varias fuentes."
+        )
+        return
+
+    sources = context.user_data.get("multi_sources", [])
+    if not sources:
+        await update.message.reply_text(
+            "⚠️ No has añadido ninguna fuente todavía. Mándame al menos una antes de /generar, "
+            "o usa /cancelar para salir del modo multi-fuente."
+        )
+        return
+
+    combined = "\n\n".join(
+        f"FUENTE {i}:\n{text}" for i, text in enumerate(sources, start=1)
+    )
+
+    context.user_data["multi_mode"] = False
+    context.user_data["multi_sources"] = []
+
+    status_msg = await update.message.reply_text(
+        f"📨 {len(sources)} fuente(s) recibidas, generando un copy conjunto…"
+    )
+    await generate_and_show_draft(status_msg, context, combined)
+
+
+async def multi_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles /cancelar: discards all accumulated sources and exits modo multi-fuente."""
+    if not context.user_data.get("multi_mode"):
+        await update.message.reply_text("ℹ️ No estás en modo multi-fuente, no hay nada que cancelar.")
+        return
+
+    context.user_data["multi_mode"] = False
+    context.user_data["multi_sources"] = []
+    await update.message.reply_text("🗑️ Modo multi-fuente cancelado. He descartado todo lo acumulado.")
+
+
+async def handle_unsupported_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Catches any command other than /start, /multi, /generar, /cancelar, without breaking multi-fuente state."""
+    if context.user_data.get("multi_mode"):
+        n = len(context.user_data.get("multi_sources", []))
+        await update.message.reply_text(
+            f"⚠️ Ese comando no lo entiendo. Sigues en modo multi-fuente con {n} fuente(s) acumulada(s): "
+            "mándame más fuentes, o usa /generar o /cancelar."
+        )
+    else:
+        await update.message.reply_text("No reconozco ese comando.")
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -495,10 +600,14 @@ def main() -> None:
     app = Application.builder().token(token).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("multi", multi_start))
+    app.add_handler(CommandHandler("generar", multi_generate))
+    app.add_handler(CommandHandler("cancelar", multi_cancel))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_press_release))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(filters.COMMAND, handle_unsupported_command))
 
     logger.info("Bot arrancado. Escuchando mensajes (long-polling)…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
