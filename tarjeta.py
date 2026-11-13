@@ -21,12 +21,12 @@ USUARIO = "@ciudadrodrigoenvivo"
 
 CATEGORIAS = {
     "MEDIO AMBIENTE": {"color": "#2E9E5B", "icono": "leaf"},
-    "OBRAS": {"color": "#D88927", "icono": "hammer"},
+    "OBRAS": {"color": "#66783B", "icono": "hard-hat"},
     "CULTURA": {"color": "#9256A8", "icono": "drama"},
     "DEPORTES": {"color": "#347DB8", "icono": "trophy"},
-    "AVISO": {"color": "#D84F4B", "icono": "alert-triangle"},
+    "AVISO": {"color": "#B9464F", "icono": "alert-triangle"},
     "AYUNTAMIENTO": {"color": "#526D9A", "icono": "landmark"},
-    "SOCIEDAD": {"color": "#B36B45", "icono": "users-round"},
+    "SOCIEDAD": {"color": "#C2577A", "icono": "users"},
 }
 
 _RAIZ = Path(__file__).resolve().parent
@@ -140,62 +140,135 @@ def _dibujar_icono(
         return x + punto[0] * escala, y + punto[1] * escala
 
     def linea(puntos: list[tuple[float, float]], ancho: int = trazo) -> None:
-        dibujo.line([p(punto) for punto in puntos], fill=color, width=ancho, joint="curve")
+        coordenadas = [p(punto) for punto in puntos]
+        dibujo.line(coordenadas, fill=color, width=ancho, joint="curve")
+        radio = ancho / 2
+        for cx, cy in coordenadas:
+            dibujo.ellipse(
+                (cx - radio, cy - radio, cx + radio, cy + radio),
+                fill=color,
+            )
+
+    def curva(puntos: tuple[tuple[float, float], ...], pasos: int = 20) -> None:
+        linea(_curva_bezier(puntos, pasos))
+
+    def circulo(centro: tuple[float, float], radio: float, ancho: int = trazo) -> None:
+        cx, cy = p(centro)
+        radio_escalado = radio * escala
+        dibujo.ellipse(
+            (
+                cx - radio_escalado,
+                cy - radio_escalado,
+                cx + radio_escalado,
+                cy + radio_escalado,
+            ),
+            outline=color,
+            width=ancho,
+        )
 
     if nombre == "leaf":
-        contorno = (
-            _curva_bezier(((20, 3), (10, 3), (4, 9), (4, 17)), 24)
-            + [(4.3, 20)]
-            + _curva_bezier(((4.3, 20), (4.8, 19.8), (5.2, 19.7), (5.7, 19.6)), 4)[1:]
-            + _curva_bezier(((5.7, 19.6), (7, 14), (10, 10), (16, 8)), 16)[1:]
-            + _curva_bezier(((16, 8), (11, 11), (8, 15), (7, 20)), 12)[1:]
-            + _curva_bezier(((7, 20), (10, 20), (13, 19), (15.5, 16.5)), 12)[1:]
-            + _curva_bezier(((15.5, 16.5), (19, 13), (20, 8), (20, 3)), 16)[1:]
-        )
-        dibujo.polygon([p(punto) for punto in contorno], fill=color)
-    elif nombre == "hammer":
-        linea([(4, 20), (14, 10)])
-        linea([(12, 4), (16, 2), (22, 8), (20, 12), (12, 4)])
-        linea([(3, 14), (9, 20)])
+        curva(((20, 3), (11, 3), (4, 8), (4, 16)))
+        curva(((4, 16), (3, 19), (5, 21), (8, 21)), 12)
+        curva(((8, 21), (15, 20), (20, 13), (20, 3)))
+        curva(((5, 19), (8, 15), (12, 11), (17, 8)), 16)
+    elif nombre == "hard-hat":
+        curva(((4, 14), (4, 9), (7, 5), (12, 5)))
+        curva(((12, 5), (17, 5), (20, 9), (20, 14)))
+        linea([(3, 14), (21, 14)])
+        linea([(5, 14), (5, 17), (7, 19), (17, 19), (19, 17), (19, 14)])
+        linea([(12, 5), (12, 14)])
     elif nombre == "drama":
-        linea([(3, 6), (7, 4), (11, 5), (12, 10), (10, 15), (6, 14), (3, 10), (3, 6)])
-        linea([(12, 7), (16, 5), (21, 7), (21, 12), (18, 16), (14, 14), (12, 10), (12, 7)])
-        linea([(5, 10), (7, 11)])
-        linea([(15, 11), (18, 10)])
-        linea([(5, 13), (9, 12)])
-        linea([(15, 14), (19, 13)])
+        curva(((3, 6), (5, 3), (9, 3), (12, 6)))
+        curva(((12, 6), (14, 9), (13, 14), (9, 18)))
+        curva(((9, 18), (5, 17), (3, 14), (2, 10)))
+        curva(((2, 10), (2, 8), (2, 7), (3, 6)), 8)
+        linea([(5, 9), (7, 9)])
+        curva(((5, 13), (6, 12), (8, 12), (9, 13)), 8)
+        curva(((13, 7), (15, 4), (19, 4), (21, 7)))
+        curva(((21, 7), (22, 10), (21, 14), (17, 17)))
+        curva(((17, 17), (14, 16), (12, 13), (12, 10)))
+        curva(((12, 10), (12, 8), (12, 7), (13, 7)), 8)
+        linea([(16, 9), (18, 9)])
+        curva(((15, 13), (16, 12), (18, 12), (19, 13)), 8)
     elif nombre == "trophy":
-        linea([(8, 3), (16, 3), (16, 9), (14, 13), (12, 14), (10, 13), (8, 9), (8, 3)])
-        linea([(8, 5), (4, 5), (4, 8), (6, 11), (10, 12)])
-        linea([(16, 5), (20, 5), (20, 8), (18, 11), (14, 12)])
-        linea([(12, 14), (12, 19), (8, 19), (7, 22), (17, 22), (16, 19), (12, 19)])
+        linea([(8, 3), (16, 3), (16, 8)])
+        curva(((16, 8), (16, 12), (14, 14), (12, 14)), 12)
+        curva(((12, 14), (10, 14), (8, 12), (8, 8)), 12)
+        linea([(8, 8), (8, 3)])
+        linea([(8, 5), (4, 5), (4, 8)])
+        curva(((4, 8), (4, 11), (6, 13), (10, 13)), 12)
+        linea([(16, 5), (20, 5), (20, 8)])
+        curva(((20, 8), (20, 11), (18, 13), (14, 13)), 12)
+        linea([(12, 14), (12, 19)])
+        linea([(8, 19), (16, 19)])
+        linea([(7, 22), (17, 22)])
+        linea([(8, 19), (7, 22), (17, 22), (16, 19)])
     elif nombre == "alert-triangle":
-        linea([(10, 4), (12, 2), (14, 4), (22, 19), (21, 21), (3, 21), (2, 19), (10, 4)])
+        linea(
+            [
+                (10, 4),
+                (11, 2),
+                (13, 2),
+                (14, 4),
+                (22, 18),
+                (22, 20),
+                (20, 21),
+                (4, 21),
+                (2, 20),
+                (2, 18),
+                (10, 4),
+            ]
+        )
         linea([(12, 8), (12, 14)])
-        dibujo.ellipse((p((11, 17)), p((13, 19))), fill=color)
+        circulo((12, 18), 1)
     elif nombre == "landmark":
-        linea([(2, 8), (12, 3), (22, 8), (2, 8)])
+        linea([(2, 8), (12, 3), (22, 8)])
+        linea([(3, 9), (21, 9)])
         linea([(4, 21), (20, 21)])
         linea([(3, 23), (21, 23)])
         for columna in (6, 12, 18):
-            linea([(columna, 9), (columna, 20)])
-    elif nombre == "users-round":
-        dibujo.ellipse((p((9, 3)), p((15, 9))), outline=color, width=trazo)
-        dibujo.ellipse((p((2, 6)), p((7, 11))), outline=color, width=trazo)
-        dibujo.ellipse((p((17, 6)), p((22, 11))), outline=color, width=trazo)
-        linea([(5, 21), (5, 18), (7, 14), (10, 12), (14, 12), (17, 14), (19, 18), (19, 21)])
-        linea([(2, 19), (2, 16), (4, 13), (7, 12)])
-        linea([(22, 19), (22, 16), (20, 13), (17, 12)])
+            linea([(columna, 10), (columna, 20)])
+    elif nombre == "users":
+        circulo((12, 7), 4)
+        circulo((4.5, 8.5), 3)
+        circulo((19.5, 8.5), 3)
+        curva(((2, 21), (2, 17), (4, 15), (7, 15)), 12)
+        linea([(7, 15), (17, 15)])
+        curva(((17, 15), (20, 15), (22, 17), (22, 21)), 12)
+        curva(((1, 18), (1, 15), (3, 13), (6, 13)), 12)
+        curva(((23, 18), (23, 15), (21, 13), (18, 13)), 12)
     else:
         raise ValueError(f"Icono de categoría no soportado: {nombre}")
 
 
+def _renderizar_icono(
+    nombre: str,
+    tamano: int,
+    color: str | tuple[int, int, int, int],
+) -> Image.Image:
+    escala = 4
+    capa = Image.new("RGBA", (tamano * escala, tamano * escala))
+    _dibujar_icono(
+        ImageDraw.Draw(capa),
+        nombre,
+        0,
+        0,
+        tamano * escala,
+        color,
+    )
+    return capa.resize((tamano, tamano), Image.Resampling.LANCZOS)
+
+
 def _icono_grande(fondo: Image.Image, icono: str, color: str) -> Image.Image:
     capa = Image.new("RGBA", fondo.size)
-    icono_capa = Image.new("RGBA", (560, 560))
-    _dibujar_icono(ImageDraw.Draw(icono_capa), icono, 0, 0, 560, (*_rgb(color), 255))
+    icono_capa = _renderizar_icono(icono, 560, (*_rgb(color), 255))
     icono_capa.putalpha(icono_capa.getchannel("A").point(lambda valor: round(valor * 0.13)))
-    capa.alpha_composite(icono_capa, (560, 190))
+    limites = icono_capa.getchannel("A").getbbox()
+    if limites is None:
+        raise ValueError(f"El icono de categoría no contiene trazos: {icono}")
+    icono_recortado = icono_capa.crop(limites)
+    x = ANCHO - 40 - icono_recortado.width
+    capa.alpha_composite(icono_recortado, (x, 190))
     return Image.alpha_composite(fondo.convert("RGBA"), capa).convert("RGB")
 
 
@@ -394,6 +467,13 @@ def _envolver_subtitulo(texto: str, fuente: ImageFont.FreeTypeFont, ancho: int) 
     return lineas
 
 
+def _normalizar_subtitulo(texto: str) -> str:
+    texto = texto.strip()
+    if not texto:
+        return ""
+    return re.sub(r"[.!?…]+$", "", texto).rstrip() + "."
+
+
 def _fecha_es(fecha: date) -> str:
     meses = ("ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic")
     return f"{fecha.day} {meses[fecha.month - 1]} {fecha.year}"
@@ -459,6 +539,7 @@ def generar_tarjeta(
     y_pie = y_linea_pie + 24
 
     fuente_subtitulo = _fuente(500, 34)
+    subtitulo = _normalizar_subtitulo(subtitulo)
     lineas_subtitulo = _envolver_subtitulo(subtitulo, fuente_subtitulo, ANCHO - 128)
     interlineado_subtitulo = 44
     y_subtitulo = y_linea_pie - 34 - len(lineas_subtitulo) * interlineado_subtitulo
@@ -472,8 +553,7 @@ def generar_tarjeta(
         radius=29,
         fill=datos_categoria["color"],
     )
-    icono_chip = Image.new("RGBA", (30, 30))
-    _dibujar_icono(ImageDraw.Draw(icono_chip), datos_categoria["icono"], 0, 0, 30, BLANCO)
+    icono_chip = _renderizar_icono(datos_categoria["icono"], 30, BLANCO)
     imagen.alpha_composite(icono_chip, (88, round(y_chip + 14)))
     _texto_con_espaciado(
         ImageDraw.Draw(imagen),

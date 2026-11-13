@@ -15,8 +15,9 @@ from docx import Document
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
-from groq import APIStatusError, AsyncGroq
+from groq import APIStatusError, AsyncGroq, GroqError
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -25,7 +26,9 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from PIL import Image
 
+from archivo_fotos import LUGARES, extraer_imagenes_pdf, fotos_para_lugar
 from tarjeta import CATEGORIAS, generar_tarjeta
 
 load_dotenv()
@@ -70,6 +73,7 @@ TONE_DISPLAY = {
     "mejora": "mejora",
 }
 MAX_CARD_METADATA = 20
+MAX_PDF_IMAGES = 8
 
 # Modelo de Whisper en Groq usado para transcribir notas de voz reenviadas (mp4/m4a/mp3/ogg/wav).
 # Groq acepta estos contenedores directamente, así que no hace falta reextraer el audio con
@@ -99,9 +103,8 @@ DOCUMENT_TOO_LONG_MESSAGE = (
     "Prueba a mandarme solo la parte relevante, o un documento más corto."
 )
 
-CARD_METADATA_INSTRUCTIONS = f"""Actualización del formato JSON de salida:
-Esta instrucción sustituye únicamente la regla que limita el JSON a dos claves.
-Conserva las reglas existentes para el tono y el copy sin modificarlos, y añade estas cinco claves:
+CARD_METADATA_INSTRUCTIONS = """Extrae metadatos para una tarjeta de noticias. No redactes el copy ni detectes el tono.
+Devuelve únicamente un objeto JSON válido con exactamente estas cinco claves:
 - "titular": titular fiel a la nota, con un máximo de 8 palabras.
 - "resaltado": el lugar, entidad o elemento concreto más reconocible que aparezca literalmente en el titular (por ejemplo, "río Águeda", "Plaza Mayor" o "Carnaval del Toro"). Nunca elijas un verbo ni una palabra genérica como "Limpieza", "Nueva" u "Obras". Si no hay un elemento concreto, elige la palabra de mayor peso informativo. Copia exactamente su escritura del titular.
 - "subtitulo": fragmento literal de la nota, sin reescribir ni añadir información, con un máximo de 15 palabras.
@@ -113,9 +116,8 @@ Conserva las reglas existentes para el tono y el copy sin modificarlos, y añade
   - CULTURA: conciertos, exposiciones, teatro o fiestas culturales.
   - DEPORTES: competiciones, clubes o instalaciones deportivas.
   - SOCIEDAD: asociaciones, sucesos, solidaridad y el resto de temas locales que no encajen mejor en otra categoría.
-- "lugar": clave obligatoria en todos los JSON. Por ahora su valor debe ser siempre el valor JSON null (sin comillas); nunca omitas esta clave.
-Devuelve exactamente las siete claves "tono", "copy", "titular", "resaltado", "subtitulo", "categoria" y "lugar", incluso si algún valor es null.
-Si no puedes completar con certeza un campo de tarjeta, devuélvelo como null; no alteres el copy por ello."""
+- "lugar": clave obligatoria en todos los JSON. Elige exactamente una etiqueta de esta lista si la noticia trata claramente de ese sitio: rio-agueda = río, canal o ribera del Águeda; puente-romano = el puente romano cuando sea el tema de la noticia. Si el puente solo se menciona como referencia de ubicación, no elijas puente-romano; para una noticia sobre la limpieza del canal o la ribera, elige rio-agueda. Las demás etiquetas son: plaza-mayor = Plaza Mayor; ayuntamiento = edificio consistorial; catedral = catedral; castillo = castillo; muralla = muralla; dehesa = dehesa. Si ninguna encaja con claridad, usa el valor JSON null (sin comillas). Nunca inventes una etiqueta ni omitas la clave.
+Si no puedes completar con certeza un campo, devuélvelo como null."""
 
 
 def is_document_too_long_error(exc: Exception) -> bool:
@@ -125,7 +127,10 @@ def is_document_too_long_error(exc: Exception) -> bool:
     return isinstance(exc, APIStatusError) and exc.status_code == 413
 
 
-def _empty_card_metadata() -> dict[str, str | None]:
+CardMetadata = dict[str, object]
+
+
+def _empty_card_metadata() -> CardMetadata:
     return {
         "titular": None,
         "resaltado": None,
@@ -137,6 +142,14 @@ def _empty_card_metadata() -> dict[str, str | None]:
 
 def _normalized_text(text: str) -> str:
     return " ".join(text.casefold().split())
+
+
+def _literal_subtitle_from_note(press_release: str) -> str | None:
+    first_sentence = re.split(r"(?<=[.!?])\s+", press_release.strip(), maxsplit=1)[0]
+    words = list(re.finditer(r"\S+", first_sentence))
+    if not words:
+        return None
+    return first_sentence[: words[min(len(words), 15) - 1].end()]
 
 
 def _trim_card_title(titular: str, resaltado: str | None) -> str:
@@ -163,7 +176,7 @@ def _trim_card_title(titular: str, resaltado: str | None) -> str:
     return titular[palabras[inicio].start() : palabras[inicio + 7].end()]
 
 
-def _parse_card_metadata(data: dict[str, object], press_release: str) -> dict[str, str | None]:
+def _parse_card_metadata(data: dict[str, object], press_release: str) -> CardMetadata:
     metadata = _empty_card_metadata()
 
     titular = data.get("titular")
@@ -196,7 +209,8 @@ def _parse_card_metadata(data: dict[str, object], press_release: str) -> dict[st
     ):
         metadata["subtitulo"] = subtitulo.strip()
     else:
-        logger.warning("Groq devolvió un subtítulo no literal o inválido.")
+        metadata["subtitulo"] = _literal_subtitle_from_note(press_release)
+        logger.warning("Groq devolvió un subtítulo no literal; uso un fragmento de la nota.")
 
     categoria = data.get("categoria")
     if isinstance(categoria, str) and categoria.strip().upper() in CATEGORIAS:
@@ -204,19 +218,21 @@ def _parse_card_metadata(data: dict[str, object], press_release: str) -> dict[st
     else:
         logger.warning("Groq devolvió una categoría de tarjeta ausente o inválida.")
 
-    if data.get("lugar") is not None:
-        logger.info("Se ignora el campo 'lugar' hasta definir su lista cerrada.")
+    lugar = data.get("lugar")
+    if isinstance(lugar, str) and lugar.strip().lower() in LUGARES:
+        metadata["lugar"] = lugar.strip().lower()
+    elif lugar is not None:
+        logger.warning("Groq devolvió un lugar que no está en la lista cerrada; se ignora.")
 
     return metadata
 
 
 async def generate_copy(
     press_release: str, temperature: float = 0.7
-) -> tuple[str, str, dict[str, str | None]]:
+) -> tuple[str, str]:
     """Calls Groq to generate an Instagram copy and detect its tone from the press release text.
 
-    Returns (copy, tono, metadatos de tarjeta). Los metadatos inválidos quedan a None
-    para que no impidan enviar el copy.
+    Returns (copy, tono), with the original two-key JSON format.
     """
     client = AsyncGroq(api_key=os.environ["GROQ_API_KEY"])
     response = await client.chat.completions.create(
@@ -224,7 +240,7 @@ async def generate_copy(
         messages=[
             {
                 "role": "system",
-                "content": f"{COPY_SYSTEM_PROMPT}\n\n{CARD_METADATA_INSTRUCTIONS}",
+                "content": COPY_SYSTEM_PROMPT,
             },
             {"role": "user", "content": press_release},
         ],
@@ -242,30 +258,78 @@ async def generate_copy(
         tone = str(data.get("tono", "")).strip().lower()
         if tone not in ALLOWED_TONES:
             tone = DEFAULT_TONE
-        return copy_text, tone, _parse_card_metadata(data, press_release)
+        return copy_text, tone
     except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
         logger.warning(
-            "Groq no devolvió un JSON válido con 'tono' y 'copy'; uso el texto en crudo y tono por defecto: %s",
+            "Groq no devolvió el JSON {tono, copy} esperado, uso el texto en crudo y tono por defecto: %s",
             exc,
         )
-        return raw, DEFAULT_TONE, _empty_card_metadata()
+        return raw, DEFAULT_TONE
+
+
+async def generate_card_metadata(press_release: str) -> CardMetadata:
+    """Generates only the five fields needed to render a news card."""
+    client = AsyncGroq(api_key=os.environ["GROQ_API_KEY"])
+    response = await client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[
+            {"role": "system", "content": CARD_METADATA_INSTRUCTIONS},
+            {"role": "user", "content": press_release},
+        ],
+        temperature=0.3,
+        max_tokens=1024,
+        reasoning_effort="low",
+        response_format={"type": "json_object"},
+    )
+    raw = response.choices[0].message.content
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("Groq devolvió una respuesta vacía para los datos de la tarjeta.")
+
+    data = json.loads(raw)
+    if not isinstance(data, dict) or set(data) != {
+        "titular",
+        "resaltado",
+        "subtitulo",
+        "categoria",
+        "lugar",
+    }:
+        raise ValueError("Groq no devolvió exactamente los cinco campos de tarjeta.")
+
+    metadata = _parse_card_metadata(data, press_release)
+    if not _has_complete_card_metadata(metadata):
+        raise ValueError("Groq no devolvió datos suficientes para crear la tarjeta.")
+    return metadata
 
 
 def _store_card_metadata(
-    context: ContextTypes.DEFAULT_TYPE, metadata: dict[str, str | None]
+    context: ContextTypes.DEFAULT_TYPE,
+    metadata: CardMetadata,
+    pdf_path: str | None = None,
+    press_release: str = "",
 ) -> str:
     card_token = secrets.token_hex(8)
     records = context.user_data.get("card_metadata")
     if not isinstance(records, dict):
         records = {}
         context.user_data["card_metadata"] = records
-    records[card_token] = metadata
+    record = dict(metadata)
+    record["_press_release"] = press_release
+    if pdf_path:
+        record["_pdf_path"] = pdf_path
+    else:
+        record["_pdf_path"] = None
+    record["_pdf_images"] = []
+    record["_archive_photos"] = None
+    record["_archive_index"] = -1
+    record["_current_photo"] = False
+    records[card_token] = record
     while len(records) > MAX_CARD_METADATA:
-        del records[next(iter(records))]
+        oldest_token = next(iter(records))
+        _cleanup_card_assets(records.pop(oldest_token))
     return card_token
 
 
-def _has_complete_card_metadata(metadata: dict[str, str | None]) -> bool:
+def _has_complete_card_metadata(metadata: CardMetadata) -> bool:
     return all(
         isinstance(metadata.get(field), str) and bool(metadata[field].strip())
         for field in ("titular", "resaltado", "subtitulo", "categoria")
@@ -274,7 +338,7 @@ def _has_complete_card_metadata(metadata: dict[str, str | None]) -> bool:
 
 def _get_card_metadata(
     context: ContextTypes.DEFAULT_TYPE, card_token: str
-) -> dict[str, str | None] | None:
+) -> CardMetadata | None:
     records = context.user_data.get("card_metadata")
     if not isinstance(records, dict) or not card_token:
         return None
@@ -283,25 +347,130 @@ def _get_card_metadata(
 
 
 def _draft_keyboard(
-    card_token: str, metadata: dict[str, str | None]
+    card_token: str,
 ) -> InlineKeyboardMarkup:
     rows = [
         [
-            InlineKeyboardButton("✅ Aprobar", callback_data="approve"),
-            InlineKeyboardButton("🔄 Regenerar", callback_data="regenerate"),
-            InlineKeyboardButton("🗑 Descartar", callback_data="discard"),
+            InlineKeyboardButton("✅ Aprobar", callback_data=f"approve:{card_token}"),
+            InlineKeyboardButton("🔄 Regenerar", callback_data=f"regenerate:{card_token}"),
+            InlineKeyboardButton("🗑 Descartar", callback_data=f"discard:{card_token}"),
         ]
     ]
-    if _has_complete_card_metadata(metadata):
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    "🖼️ Necesito imagen",
-                    callback_data=f"need_image:{card_token}",
-                )
-            ]
-        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "🖼️ Necesito imagen",
+                callback_data=f"need_image:{card_token}",
+            )
+        ]
+    )
     return InlineKeyboardMarkup(rows)
+
+
+def _remove_local_file(path: str | Path | None) -> None:
+    if not path:
+        return
+    try:
+        Path(path).unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("No se pudo eliminar el archivo temporal %s: %s", path, exc)
+
+
+def _cleanup_card_assets(metadata: CardMetadata) -> None:
+    _remove_local_file(metadata.get("_pdf_path") if isinstance(metadata.get("_pdf_path"), str) else None)
+    images = metadata.get("_pdf_images")
+    if isinstance(images, list):
+        for image_path in images:
+            if isinstance(image_path, str):
+                _remove_local_file(image_path)
+
+
+def _delete_card_metadata(context: ContextTypes.DEFAULT_TYPE, card_token: str) -> None:
+    records = context.user_data.get("card_metadata")
+    if isinstance(records, dict):
+        record = records.pop(card_token, None)
+        if isinstance(record, dict):
+            _cleanup_card_assets(record)
+    if context.user_data.get("current_card_token") == card_token:
+        context.user_data["current_card_token"] = None
+        context.user_data["current_pdf_path"] = None
+
+
+def _get_pdf_temp_dir(context: ContextTypes.DEFAULT_TYPE) -> Path:
+    temporary_directory = context.bot_data.get("pdf_temp_dir")
+    if not isinstance(temporary_directory, tempfile.TemporaryDirectory):
+        temporary_directory = tempfile.TemporaryDirectory(prefix="bot-cr-pdf-")
+        context.bot_data["pdf_temp_dir"] = temporary_directory
+    return Path(temporary_directory.name)
+
+
+async def _cleanup_pdf_temp_dir(application: Application) -> None:
+    temporary_directory = application.bot_data.pop("pdf_temp_dir", None)
+    if isinstance(temporary_directory, tempfile.TemporaryDirectory):
+        temporary_directory.cleanup()
+
+
+def _render_card_jpeg(metadata: CardMetadata, photo: str | Path | None = None) -> bytes:
+    titular = metadata.get("titular")
+    resaltado = metadata.get("resaltado")
+    subtitulo = metadata.get("subtitulo")
+    categoria = metadata.get("categoria")
+    if not all(
+        isinstance(value, str) and value.strip()
+        for value in (titular, resaltado, subtitulo, categoria)
+    ):
+        raise ValueError("Faltan datos válidos para crear la tarjeta.")
+    png = generar_tarjeta(
+        titular,
+        resaltado,
+        subtitulo,
+        categoria,
+        foto=photo,
+    )
+    with Image.open(BytesIO(png)) as image:
+        output = BytesIO()
+        image.convert("RGB").save(output, format="JPEG", quality=90, optimize=True)
+    return output.getvalue()
+
+
+async def _send_card(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    card_token: str,
+    metadata: CardMetadata,
+    photo: str | Path | None = None,
+    with_keyboard: bool = True,
+) -> None:
+    jpeg_bytes = await asyncio.to_thread(_render_card_jpeg, metadata, photo)
+    await context.bot.send_photo(
+        chat_id=chat_id,
+        photo=InputFile(BytesIO(jpeg_bytes), filename="tarjeta.jpg"),
+        reply_markup=_card_keyboard(card_token) if with_keyboard else None,
+    )
+
+
+def _cached_pdf_images(metadata: CardMetadata) -> list[str]:
+    images = metadata.get("_pdf_images")
+    if not isinstance(images, list):
+        return []
+    return [path for path in images if isinstance(path, str) and Path(path).is_file()]
+
+
+async def _send_pdf_image_choices(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    card_token: str,
+    image_paths: list[str],
+) -> None:
+    for index, image_path in enumerate(image_paths):
+        await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=InputFile(BytesIO(Path(image_path).read_bytes()), filename=f"imagen-{index + 1}.jpg"),
+            caption=f"Imagen {index + 1} del PDF",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("✅ Usar esta imagen", callback_data=f"pdf_foto:{card_token}:{index}")]]
+            ),
+        )
 
 
 def _card_keyboard(card_token: str) -> InlineKeyboardMarkup:
@@ -395,16 +564,23 @@ async def transcribe_audio(file_path: str) -> str:
 
 
 async def handle_extracted_text(
-    status_msg, context: ContextTypes.DEFAULT_TYPE, text: str, notice: str = ""
+    status_msg,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    notice: str = "",
+    pdf_path: str | None = None,
 ) -> None:
     """Routes freshly extracted text (from any input type) to the normal draft flow,
     or to the multi-fuente accumulator if that mode is active for this chat.
 
     notice, si se pasa (p. ej. PDF_TRUNCATED_NOTICE), se muestra junto al resultado."""
     if context.user_data.get("multi_mode"):
+        _remove_local_file(pdf_path)
         await accumulate_multi_source(status_msg, context, text, notice=notice)
     else:
-        await generate_and_show_draft(status_msg, context, text, notice=notice)
+        await generate_and_show_draft(
+            status_msg, context, text, notice=notice, pdf_path=pdf_path
+        )
 
 
 async def accumulate_multi_source(
@@ -420,7 +596,11 @@ async def accumulate_multi_source(
 
 
 async def generate_and_show_draft(
-    status_msg, context: ContextTypes.DEFAULT_TYPE, press_release: str, notice: str = ""
+    status_msg,
+    context: ContextTypes.DEFAULT_TYPE,
+    press_release: str,
+    notice: str = "",
+    pdf_path: str | None = None,
 ) -> None:
     """Generates a copy from the press release text and shows it with the approve/regenerate/discard buttons."""
     context.user_data["press_release"] = press_release
@@ -428,13 +608,15 @@ async def generate_and_show_draft(
     await status_msg.edit_text("⏳ Generando copy…")
 
     try:
-        draft, tone, card_metadata = await generate_copy(press_release)
+        draft, tone = await generate_copy(press_release)
     except Exception as exc:
         if is_document_too_long_error(exc):
             logger.warning("Documento demasiado largo para Groq (413): %s", exc)
+            _remove_local_file(pdf_path)
             await status_msg.edit_text(DOCUMENT_TOO_LONG_MESSAGE)
             return
         logger.error("Error al llamar a Groq: %s", exc)
+        _remove_local_file(pdf_path)
         await status_msg.edit_text(
             "❌ No se pudo generar el copy. "
             "Comprueba tu <code>GROQ_API_KEY</code> o inténtalo de nuevo en unos segundos.",
@@ -444,7 +626,14 @@ async def generate_and_show_draft(
 
     context.user_data["current_draft"] = draft
     context.user_data["current_tone"] = tone
-    card_token = _store_card_metadata(context, card_metadata)
+    card_token = _store_card_metadata(
+        context,
+        _empty_card_metadata(),
+        pdf_path,
+        press_release=press_release,
+    )
+    context.user_data["current_card_token"] = card_token
+    context.user_data["current_pdf_path"] = pdf_path
 
     message = (
         f"📝 <b>Borrador de copy:</b>\n"
@@ -456,7 +645,7 @@ async def generate_and_show_draft(
 
     await status_msg.edit_text(
         message,
-        reply_markup=_draft_keyboard(card_token, card_metadata),
+        reply_markup=_draft_keyboard(card_token),
         parse_mode="HTML",
     )
 
@@ -507,7 +696,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     status_msg = await update.message.reply_text("⏳ Descargando documento…")
 
     try:
-        text, truncated = await extract_text_from_pdf_or_docx_document(document, ext)
+        text, truncated, pdf_path = await extract_text_from_pdf_or_docx_document(
+            document, ext, _get_pdf_temp_dir(context) if ext == ".pdf" else None
+        )
     except Exception as exc:
         logger.error("Error al leer el documento: %s", exc)
         await status_msg.edit_text(
@@ -517,6 +708,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     text = text.strip()
     if not text:
+        _remove_local_file(pdf_path)
         await status_msg.edit_text(
             "⚠️ No encontré texto en ese documento. Si es un PDF escaneado (solo imagen), "
             "de momento no puedo leerlo — pega el texto directamente."
@@ -524,33 +716,43 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     notice = PDF_TRUNCATED_NOTICE if truncated else ""
-    await handle_extracted_text(status_msg, context, text, notice=notice)
+    await handle_extracted_text(
+        status_msg, context, text, notice=notice, pdf_path=pdf_path
+    )
 
 
-async def extract_text_from_pdf_or_docx_document(document, ext: str) -> tuple[str, bool]:
+async def extract_text_from_pdf_or_docx_document(
+    document,
+    ext: str,
+    temp_dir: Path | None = None,
+) -> tuple[str, bool, str | None]:
     """Downloads a Telegram PDF/DOCX document and extracts its text, reusing the existing extractors.
 
-    Devuelve (texto, truncado). truncado solo puede ser True para PDF (ver PDF_MAX_PAGES);
-    DOCX se extrae siempre completo.
+    Devuelve (texto, truncado, ruta_temporal_pdf). DOCX se elimina al terminar;
+    los PDF se conservan hasta que se solicitan las imágenes de archivo.
     """
     tmp_path = None
+    keep_file = False
     try:
         tg_file = await document.get_file()
-        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+        with tempfile.NamedTemporaryFile(
+            suffix=ext, dir=temp_dir, delete=False
+        ) as tmp:
             tmp_path = tmp.name
         await tg_file.download_to_drive(tmp_path)
 
         loop = asyncio.get_running_loop()
         if ext == ".pdf":
-            return await loop.run_in_executor(None, extract_text_from_pdf, tmp_path)
+            text, truncated = await loop.run_in_executor(
+                None, extract_text_from_pdf, tmp_path
+            )
+            keep_file = True
+            return text, truncated, tmp_path
         text = await loop.run_in_executor(None, extract_text_from_docx, tmp_path)
-        return text, False
+        return text, False, None
     finally:
-        if tmp_path:
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
+        if tmp_path and not keep_file:
+            _remove_local_file(tmp_path)
 
 
 async def handle_audio_document(update: Update, context: ContextTypes.DEFAULT_TYPE, document, ext: str) -> None:
@@ -708,26 +910,59 @@ async def handle_unsupported_command(update: Update, context: ContextTypes.DEFAU
         await update.message.reply_text("No reconozco ese comando.")
 
 
+async def _archive_photos_for_card(metadata: CardMetadata) -> list[str]:
+    cached = metadata.get("_archive_photos")
+    if isinstance(cached, list):
+        return [
+            path
+            for path in cached
+            if isinstance(path, str) and Path(path).is_file()
+        ]
+    lugar = metadata.get("lugar")
+    try:
+        photos = await asyncio.to_thread(
+            fotos_para_lugar, lugar if isinstance(lugar, str) else None
+        )
+    except (OSError, ValueError) as exc:
+        logger.error("No se pudo consultar el archivo de fotos: %s", exc)
+        metadata["_archive_photos"] = []
+        return []
+    photo_paths = [str(path) for path in photos]
+    metadata["_archive_photos"] = photo_paths
+    return photo_paths
+
+
+async def _send_archive_card(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    card_token: str,
+    metadata: CardMetadata,
+    index: int,
+) -> bool:
+    photos = await _archive_photos_for_card(metadata)
+    if index < 0 or index >= len(photos):
+        return False
+    await _send_card(context, chat_id, card_token, metadata, photos[index])
+    metadata["_archive_index"] = index
+    metadata["_current_photo"] = True
+    return True
+
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handles draft and generated-card inline button callbacks."""
     query = update.callback_query
     if query is None:
         return
     callback_data = query.data or ""
-    action, _, card_token = callback_data.partition(":")
+    callback_parts = callback_data.split(":")
+    action = callback_parts[0]
+    card_token = callback_parts[1] if len(callback_parts) > 1 else ""
 
-    if action in {"need_image", "otra_foto", "sin_foto"}:
+    if action in {"need_image", "otra_foto", "sin_foto", "pdf_foto"}:
         card_metadata = _get_card_metadata(context, card_token)
         if card_metadata is None:
             await query.answer(
                 "Esta noticia es anterior al último reinicio, vuelve a enviarla",
-                show_alert=True,
-            )
-            return
-
-        if action == "otra_foto":
-            await query.answer(
-                "Aún no hay un archivo de fotos disponible.",
                 show_alert=True,
             )
             return
@@ -741,9 +976,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 return
             await query.answer("Tarjeta confirmada sin foto.")
             await query.edit_message_reply_markup(reply_markup=None)
-            records = context.user_data.get("card_metadata")
-            if isinstance(records, dict):
-                records.pop(card_token, None)
+            if card_metadata.get("_current_photo"):
+                try:
+                    await _send_card(
+                        context,
+                        query.message.chat.id,
+                        card_token,
+                        card_metadata,
+                        with_keyboard=False,
+                    )
+                except (OSError, TypeError, ValueError, TelegramError) as exc:
+                    logger.error("No se pudo generar la tarjeta sin foto: %s", exc)
+                    await context.bot.send_message(
+                        chat_id=query.message.chat.id,
+                        text="❌ No se pudo generar la tarjeta sin foto.",
+                    )
+            _delete_card_metadata(context, card_token)
             return
 
         if query.message is None:
@@ -753,6 +1001,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
             return
 
+        if action == "need_image" and not _has_complete_card_metadata(card_metadata):
+            press_release = card_metadata.get("_press_release")
+            if not isinstance(press_release, str) or not press_release.strip():
+                await query.answer(
+                    "No encuentro la nota original para preparar la tarjeta.",
+                    show_alert=True,
+                )
+                return
+            try:
+                card_metadata.update(await generate_card_metadata(press_release))
+            except (GroqError, ValueError, KeyError) as exc:
+                logger.error("No se pudieron generar los datos de la tarjeta: %s", exc)
+                await query.answer(
+                    "No se pudieron generar los datos de la tarjeta. Prueba de nuevo.",
+                    show_alert=True,
+                )
+                return
+
         if not _has_complete_card_metadata(card_metadata):
             await query.answer(
                 "No hay datos válidos para crear la tarjeta de esta noticia.",
@@ -760,42 +1026,116 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
             return
 
-        titular = card_metadata.get("titular")
-        resaltado = card_metadata.get("resaltado")
-        subtitulo = card_metadata.get("subtitulo")
-        categoria = card_metadata.get("categoria")
-        if not all(
-            isinstance(value, str) and value.strip()
-            for value in (titular, resaltado, subtitulo, categoria)
-        ):
-            await query.answer(
-                "El copy está disponible, pero faltan datos válidos para crear la tarjeta.",
-                show_alert=True,
-            )
+        if action == "pdf_foto":
+            image_paths = _cached_pdf_images(card_metadata)
+            try:
+                image_index = int(callback_parts[2])
+            except (IndexError, ValueError):
+                image_index = -1
+            if image_index < 0 or image_index >= len(image_paths):
+                await query.answer("Esa imagen del PDF ya no está disponible.", show_alert=True)
+                return
+            await query.answer()
+            try:
+                await _send_card(
+                    context,
+                    query.message.chat.id,
+                    card_token,
+                    card_metadata,
+                    image_paths[image_index],
+                )
+            except (OSError, TypeError, ValueError, TelegramError) as exc:
+                logger.error("No se pudo generar la tarjeta con la imagen del PDF: %s", exc)
+                await context.bot.send_message(
+                    chat_id=query.message.chat.id,
+                    text="❌ No se pudo generar la tarjeta con esa imagen.",
+                )
+                return
+            card_metadata["_current_photo"] = True
+            _cleanup_card_assets({"_pdf_images": image_paths})
+            card_metadata["_pdf_images"] = []
+            return
+
+        if action == "otra_foto":
+            next_index = card_metadata.get("_archive_index", -1)
+            next_index = next_index + 1 if isinstance(next_index, int) else 0
+            await query.answer()
+            try:
+                sent = await _send_archive_card(
+                    context,
+                    query.message.chat.id,
+                    card_token,
+                    card_metadata,
+                    next_index,
+                )
+            except (OSError, TypeError, ValueError, TelegramError) as exc:
+                logger.error("No se pudo enviar otra foto de archivo: %s", exc)
+                await context.bot.send_message(
+                    chat_id=query.message.chat.id,
+                    text="❌ No se pudo enviar otra foto de archivo.",
+                )
+                return
+            if not sent:
+                await context.bot.send_message(
+                    chat_id=query.message.chat.id,
+                    text="No hay más fotos de archivo para este lugar.",
+                )
             return
 
         await query.answer()
+        pdf_path = card_metadata.get("_pdf_path")
+        pdf_images = _cached_pdf_images(card_metadata)
+        if not pdf_images and isinstance(pdf_path, str) and Path(pdf_path).is_file():
+            try:
+                extracted_paths = await asyncio.to_thread(
+                    extraer_imagenes_pdf,
+                    pdf_path,
+                    _get_pdf_temp_dir(context),
+                    PDF_MAX_PAGES,
+                    MAX_PDF_IMAGES,
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                logger.warning("No se pudieron extraer imágenes del PDF: %s", exc)
+                extracted_paths = []
+            finally:
+                _remove_local_file(pdf_path)
+                card_metadata["_pdf_path"] = None
+                if context.user_data.get("current_pdf_path") == pdf_path:
+                    context.user_data["current_pdf_path"] = None
+            pdf_images = [str(path) for path in extracted_paths]
+            card_metadata["_pdf_images"] = pdf_images
+
+        if pdf_images:
+            try:
+                await _send_pdf_image_choices(
+                    context,
+                    query.message.chat.id,
+                    card_token,
+                    pdf_images,
+                )
+            except (OSError, TelegramError) as exc:
+                logger.error("No se pudieron enviar las imágenes del PDF: %s", exc)
+                await context.bot.send_message(
+                    chat_id=query.message.chat.id,
+                    text="❌ No se pudieron enviar las imágenes del PDF.",
+                )
+            return
+
         try:
-            image_bytes = await asyncio.to_thread(
-                generar_tarjeta,
-                titular,
-                resaltado,
-                subtitulo,
-                categoria,
+            sent = await _send_archive_card(
+                context, query.message.chat.id, card_token, card_metadata, 0
             )
-        except (OSError, TypeError, ValueError) as exc:
+            if not sent:
+                card_metadata["_current_photo"] = False
+                await _send_card(
+                    context, query.message.chat.id, card_token, card_metadata
+                )
+        except (OSError, TypeError, ValueError, TelegramError) as exc:
             logger.error("No se pudo generar la tarjeta: %s", exc)
             await context.bot.send_message(
                 chat_id=query.message.chat.id,
                 text="❌ No se pudo generar la tarjeta. Inténtalo de nuevo más tarde.",
             )
-            return
-
-        await context.bot.send_photo(
-            chat_id=query.message.chat.id,
-            photo=InputFile(BytesIO(image_bytes), filename="tarjeta.png"),
-            reply_markup=_card_keyboard(card_token),
-        )
         return
 
     press_release_to_regenerate = ""
@@ -820,6 +1160,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             f"<pre>{html.escape(draft)}</pre>",
             parse_mode="HTML",
         )
+        target_token = card_token or context.user_data.get("current_card_token")
+        if isinstance(target_token, str):
+            _delete_card_metadata(context, target_token)
 
     elif action == "regenerate":
         # Remove buttons while generating to prevent double-taps
@@ -827,7 +1170,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         try:
             # Slightly higher temperature so the new draft varies from the previous one
-            draft, tone, card_metadata = await generate_copy(
+            draft, tone = await generate_copy(
                 press_release_to_regenerate, temperature=0.9
             )
         except Exception as exc:
@@ -841,27 +1184,52 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
             return
 
+        pdf_path = context.user_data.get("current_pdf_path")
+        previous_token = context.user_data.get("current_card_token")
+        previous_record = (
+            _get_card_metadata(context, previous_token)
+            if isinstance(previous_token, str)
+            else None
+        )
+        if (
+            previous_record is not None
+            and previous_record.get("_pdf_path") == pdf_path
+        ):
+            previous_record["_pdf_path"] = None
         context.user_data["current_draft"] = draft
         context.user_data["current_tone"] = tone
-        card_token = _store_card_metadata(context, card_metadata)
+        card_token = _store_card_metadata(
+            context,
+            _empty_card_metadata(),
+            pdf_path if isinstance(pdf_path, str) else None,
+            press_release=press_release_to_regenerate,
+        )
+        context.user_data["current_card_token"] = card_token
+        context.user_data["current_pdf_path"] = (
+            pdf_path if isinstance(pdf_path, str) else None
+        )
 
         await query.edit_message_text(
             f"📝 <b>Borrador de copy:</b>\n"
             f"Tono detectado: <b>{TONE_DISPLAY[tone]}</b>\n\n"
             f"<pre>{html.escape(draft)}</pre>",
-            reply_markup=_draft_keyboard(card_token, card_metadata),
+            reply_markup=_draft_keyboard(card_token),
             parse_mode="HTML",
         )
 
     elif action == "discard":
         await query.message.delete()
+        target_token = card_token or context.user_data.get("current_card_token")
+        if isinstance(target_token, str):
+            _delete_card_metadata(context, target_token)
 
 
 def setup_langfuse_tracing() -> None:
     """Activa el tracing de Langfuse para las llamadas a Groq y Gemini.
 
     Instrumentación NO invasiva: parchea los SDKs de Groq y google-genai a nivel de
-    cliente (vía OpenInference), así que generate_copy() y describe_poster_image()
+    cliente (vía OpenInference), así que generate_copy(), generate_card_metadata() y
+    describe_poster_image()
     no se tocan. Cualquier fallo aquí (credenciales ausentes/erróneas, red, host mal
     configurado...) se registra en el log y el bot sigue funcionando sin observabilidad.
     """
@@ -910,6 +1278,7 @@ def main() -> None:
     setup_langfuse_tracing()
 
     app = Application.builder().token(token).build()
+    app.post_shutdown(_cleanup_pdf_temp_dir)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("multi", multi_start))

@@ -62,7 +62,30 @@ jobs:
           username: ${{ secrets.GCP_SSH_USER }}
           key: ${{ secrets.GCP_SSH_PRIVATE_KEY }}
           script: |
+            set -eu
+
+            ENV_FILE=/home/deploy/.env
+            if [ ! -f "$ENV_FILE" ]; then
+              echo "Required environment file not found: $ENV_FILE" >&2
+              exit 1
+            fi
+
+            mkdir -p /home/deploy/bot-cr-archivo
             docker pull rodrs03/bot-cr-en-vivo:latest
             docker stop bot-cr || true
             docker rm bot-cr || true
-            docker run -d --name bot-cr --env-file .env --restart unless-stopped rodrs03/bot-cr-en-vivo:latest
+            if ! docker run -d --name bot-cr --env-file "$ENV_FILE" -v /home/deploy/bot-cr-archivo:/app/archivo:ro --restart unless-stopped rodrs03/bot-cr-en-vivo:latest; then
+              echo "Failed to start bot-cr. Last container logs:" >&2
+              docker logs --tail 100 bot-cr || true
+              exit 1
+            fi
+
+            sleep 5
+            RUNNING=$(docker inspect --format='{{.State.Running}}' bot-cr 2>/dev/null || true)
+            if [ "$RUNNING" != "true" ]; then
+              echo "bot-cr is not running. Last container logs:" >&2
+              docker logs --tail 100 bot-cr || true
+              exit 1
+            fi
+
+            echo "bot-cr is running."

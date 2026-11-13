@@ -89,3 +89,5 @@ REGLAS DE SALIDA:
   - "copy": el texto del copy, listo para pegar en Instagram. Sin introducciones, sin comillas envolventes, sin explicaciones, sin "Aquí tienes...".
 - No inventes datos que no estén en la nota de prensa.
 - Si la nota llega en otro idioma, escribe el copy en español.
+- No incluyas ningún dato (lugares, horarios, fechas, cifras, contactos) que no aparezca en la nota.
+- La cuenta es un medio de noticias local independiente: escribe siempre en tercera persona; nunca hables en nombre del Ayuntamiento ni de los organizadores.

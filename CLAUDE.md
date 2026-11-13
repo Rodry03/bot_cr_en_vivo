@@ -27,6 +27,8 @@ Para audio, el patrón es análogo: `handle_document` detecta que el documento e
 
 `generate_copy()` devuelve una tupla `(copy, tono)`; el tono es uno de `festivo/sobrio/alerta/politico/mejora` (`ALLOWED_TONES` en bot.py), con fallback a `"festivo"` si el JSON no parsea. Se muestra en Telegram como línea "Tono detectado: X" fuera del bloque `<pre>` del copy (para que el botón de copiar de Telegram solo copie el copy limpio).
 
+La nota original se conserva junto al token de cada noticia (máximo 20). El botón **🖼️ Necesito imagen** llama entonces a `generate_card_metadata()` por separado para obtener los cinco campos de la tarjeta; un error se comunica con una alerta sin afectar al copy.
+
 ## Estado actual (actualizado)
 
 El bot está en producción, corriendo containerizado en un servidor remoto, y funciona con cinco entradas: texto, PDF, DOCX, fotos (carteles) y audio (notas de voz reenviadas).
