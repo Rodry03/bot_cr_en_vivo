@@ -1270,16 +1270,13 @@ def setup_langfuse_tracing() -> None:
         )
 
 
-def main() -> None:
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    if not token:
-        raise ValueError("TELEGRAM_BOT_TOKEN no está definido en el archivo .env")
-
-    setup_langfuse_tracing()
-
-    app = Application.builder().token(token).build()
-    app.post_shutdown(_cleanup_pdf_temp_dir)
-
+def _build_application(token: str) -> Application:
+    app = (
+        Application.builder()
+        .token(token)
+        .post_shutdown(_cleanup_pdf_temp_dir)
+        .build()
+    )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("multi", multi_start))
     app.add_handler(CommandHandler("generar", multi_generate))
@@ -1289,7 +1286,16 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.COMMAND, handle_unsupported_command))
+    return app
 
+
+def main() -> None:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not token:
+        raise ValueError("TELEGRAM_BOT_TOKEN no está definido en el archivo .env")
+
+    setup_langfuse_tracing()
+    app = _build_application(token)
     logger.info("Bot arrancado. Escuchando mensajes (long-polling)…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
