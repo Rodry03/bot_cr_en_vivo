@@ -4,7 +4,10 @@ import html
 import json
 import logging
 import os
+import re
+import secrets
 import tempfile
+from io import BytesIO
 from pathlib import Path
 
 import pdfplumber
@@ -13,7 +16,7 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
 from groq import APIStatusError, AsyncGroq
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -22,6 +25,8 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+
+from tarjeta import CATEGORIAS, generar_tarjeta
 
 load_dotenv()
 
@@ -64,6 +69,7 @@ TONE_DISPLAY = {
     "politico": "político",
     "mejora": "mejora",
 }
+MAX_CARD_METADATA = 20
 
 # Modelo de Whisper en Groq usado para transcribir notas de voz reenviadas (mp4/m4a/mp3/ogg/wav).
 # Groq acepta estos contenedores directamente, así que no hace falta reextraer el audio con
@@ -88,19 +94,28 @@ Reglas estrictas:
 neutra y estructurada, como si fuera una ficha de datos.
 - Si algún dato no es legible o no aparece, simplemente no lo incluyas (no lo rellenes)."""
 
-DRAFT_KEYBOARD = InlineKeyboardMarkup([
-    [
-        InlineKeyboardButton("✅ Aprobar", callback_data="approve"),
-        InlineKeyboardButton("🔄 Regenerar", callback_data="regenerate"),
-        InlineKeyboardButton("🗑 Descartar", callback_data="discard"),
-    ]
-])
-
-
 DOCUMENT_TOO_LONG_MESSAGE = (
     "⚠️ El documento es demasiado largo para procesarlo de una vez. "
     "Prueba a mandarme solo la parte relevante, o un documento más corto."
 )
+
+CARD_METADATA_INSTRUCTIONS = f"""Actualización del formato JSON de salida:
+Esta instrucción sustituye únicamente la regla que limita el JSON a dos claves.
+Conserva las reglas existentes para el tono y el copy sin modificarlos, y añade estas cinco claves:
+- "titular": titular fiel a la nota, con un máximo de 8 palabras.
+- "resaltado": el lugar, entidad o elemento concreto más reconocible que aparezca literalmente en el titular (por ejemplo, "río Águeda", "Plaza Mayor" o "Carnaval del Toro"). Nunca elijas un verbo ni una palabra genérica como "Limpieza", "Nueva" u "Obras". Si no hay un elemento concreto, elige la palabra de mayor peso informativo. Copia exactamente su escritura del titular.
+- "subtitulo": fragmento literal de la nota, sin reescribir ni añadir información, con un máximo de 15 palabras.
+- "categoria": elige exactamente una categoría de esta lista y aplica estas definiciones:
+  - MEDIO AMBIENTE: ríos, naturaleza, limpiezas, residuos, zonas verdes o animales.
+  - OBRAS: construcción, reformas, asfaltado o cortes de calles causados por obras.
+  - AVISO: cortes de agua o luz, alertas o cambios urgentes de horario.
+  - AYUNTAMIENTO: plenos, presupuestos, trámites o subvenciones.
+  - CULTURA: conciertos, exposiciones, teatro o fiestas culturales.
+  - DEPORTES: competiciones, clubes o instalaciones deportivas.
+  - SOCIEDAD: asociaciones, sucesos, solidaridad y el resto de temas locales que no encajen mejor en otra categoría.
+- "lugar": clave obligatoria en todos los JSON. Por ahora su valor debe ser siempre el valor JSON null (sin comillas); nunca omitas esta clave.
+Devuelve exactamente las siete claves "tono", "copy", "titular", "resaltado", "subtitulo", "categoria" y "lugar", incluso si algún valor es null.
+Si no puedes completar con certeza un campo de tarjeta, devuélvelo como null; no alteres el copy por ello."""
 
 
 def is_document_too_long_error(exc: Exception) -> bool:
@@ -110,18 +125,107 @@ def is_document_too_long_error(exc: Exception) -> bool:
     return isinstance(exc, APIStatusError) and exc.status_code == 413
 
 
-async def generate_copy(press_release: str, temperature: float = 0.7) -> tuple[str, str]:
+def _empty_card_metadata() -> dict[str, str | None]:
+    return {
+        "titular": None,
+        "resaltado": None,
+        "subtitulo": None,
+        "categoria": None,
+        "lugar": None,
+    }
+
+
+def _normalized_text(text: str) -> str:
+    return " ".join(text.casefold().split())
+
+
+def _trim_card_title(titular: str, resaltado: str | None) -> str:
+    palabras = list(re.finditer(r"\S+", titular))
+    if len(palabras) <= 8:
+        return titular
+
+    inicio = 0
+    coincidencia = re.search(re.escape(resaltado), titular) if resaltado else None
+    if coincidencia:
+        indices_resaltados = [
+            indice
+            for indice, palabra in enumerate(palabras)
+            if palabra.start() < coincidencia.end() and coincidencia.start() < palabra.end()
+        ]
+        if indices_resaltados and indices_resaltados[-1] >= 8:
+            primero, ultimo = indices_resaltados[0], indices_resaltados[-1]
+            palabras_resaltadas = ultimo - primero + 1
+            inicio = max(0, primero - (8 - palabras_resaltadas) // 2)
+            inicio = min(inicio, len(palabras) - 8, primero)
+            if inicio + 8 <= ultimo:
+                inicio = ultimo - 7
+
+    return titular[palabras[inicio].start() : palabras[inicio + 7].end()]
+
+
+def _parse_card_metadata(data: dict[str, object], press_release: str) -> dict[str, str | None]:
+    metadata = _empty_card_metadata()
+
+    titular = data.get("titular")
+    resaltado = data.get("resaltado")
+    resaltado_texto = resaltado.strip() if isinstance(resaltado, str) else None
+    if isinstance(titular, str) and titular.strip():
+        titular_texto = titular.strip()
+        if len(titular_texto.split()) > 8:
+            titular_texto = _trim_card_title(titular_texto, resaltado_texto)
+            logger.warning("Titular de tarjeta recortado al máximo de 8 palabras.")
+        metadata["titular"] = titular_texto
+    else:
+        logger.warning("Groq devolvió un titular de tarjeta ausente o inválido.")
+
+    if (
+        resaltado_texto
+        and metadata["titular"]
+        and resaltado_texto in metadata["titular"]
+    ):
+        metadata["resaltado"] = resaltado_texto
+    else:
+        logger.warning("Groq devolvió un resaltado de tarjeta ausente o inválido.")
+
+    subtitulo = data.get("subtitulo")
+    if (
+        isinstance(subtitulo, str)
+        and subtitulo.strip()
+        and len(subtitulo.split()) <= 15
+        and _normalized_text(subtitulo) in _normalized_text(press_release)
+    ):
+        metadata["subtitulo"] = subtitulo.strip()
+    else:
+        logger.warning("Groq devolvió un subtítulo no literal o inválido.")
+
+    categoria = data.get("categoria")
+    if isinstance(categoria, str) and categoria.strip().upper() in CATEGORIAS:
+        metadata["categoria"] = categoria.strip().upper()
+    else:
+        logger.warning("Groq devolvió una categoría de tarjeta ausente o inválida.")
+
+    if data.get("lugar") is not None:
+        logger.info("Se ignora el campo 'lugar' hasta definir su lista cerrada.")
+
+    return metadata
+
+
+async def generate_copy(
+    press_release: str, temperature: float = 0.7
+) -> tuple[str, str, dict[str, str | None]]:
     """Calls Groq to generate an Instagram copy and detect its tone from the press release text.
 
-    Returns (copy, tono), donde tono es uno de ALLOWED_TONES. Si el modelo no devuelve
-    un JSON válido con esas claves, se hace fallback a (texto_crudo, DEFAULT_TONE) para
-    que el bot nunca se rompa por esto.
+    Returns (copy, tono, metadatos de tarjeta). Los metadatos inválidos quedan a None
+    para que no impidan enviar el copy.
     """
     client = AsyncGroq(api_key=os.environ["GROQ_API_KEY"])
     response = await client.chat.completions.create(
         model=GROQ_MODEL,
         messages=[
-            {"role": "system", "content": COPY_SYSTEM_PROMPT},
+            {
+                "role": "system",
+                "content": f"{COPY_SYSTEM_PROMPT}\n\n{CARD_METADATA_INSTRUCTIONS}",
+            },
             {"role": "user", "content": press_release},
         ],
         temperature=temperature,
@@ -138,13 +242,77 @@ async def generate_copy(press_release: str, temperature: float = 0.7) -> tuple[s
         tone = str(data.get("tono", "")).strip().lower()
         if tone not in ALLOWED_TONES:
             tone = DEFAULT_TONE
-        return copy_text, tone
+        return copy_text, tone, _parse_card_metadata(data, press_release)
     except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
         logger.warning(
-            "Groq no devolvió el JSON {tono, copy} esperado, uso el texto en crudo y tono por defecto: %s",
+            "Groq no devolvió un JSON válido con 'tono' y 'copy'; uso el texto en crudo y tono por defecto: %s",
             exc,
         )
-        return raw, DEFAULT_TONE
+        return raw, DEFAULT_TONE, _empty_card_metadata()
+
+
+def _store_card_metadata(
+    context: ContextTypes.DEFAULT_TYPE, metadata: dict[str, str | None]
+) -> str:
+    card_token = secrets.token_hex(8)
+    records = context.user_data.get("card_metadata")
+    if not isinstance(records, dict):
+        records = {}
+        context.user_data["card_metadata"] = records
+    records[card_token] = metadata
+    while len(records) > MAX_CARD_METADATA:
+        del records[next(iter(records))]
+    return card_token
+
+
+def _has_complete_card_metadata(metadata: dict[str, str | None]) -> bool:
+    return all(
+        isinstance(metadata.get(field), str) and bool(metadata[field].strip())
+        for field in ("titular", "resaltado", "subtitulo", "categoria")
+    )
+
+
+def _get_card_metadata(
+    context: ContextTypes.DEFAULT_TYPE, card_token: str
+) -> dict[str, str | None] | None:
+    records = context.user_data.get("card_metadata")
+    if not isinstance(records, dict) or not card_token:
+        return None
+    metadata = records.get(card_token)
+    return metadata if isinstance(metadata, dict) else None
+
+
+def _draft_keyboard(
+    card_token: str, metadata: dict[str, str | None]
+) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton("✅ Aprobar", callback_data="approve"),
+            InlineKeyboardButton("🔄 Regenerar", callback_data="regenerate"),
+            InlineKeyboardButton("🗑 Descartar", callback_data="discard"),
+        ]
+    ]
+    if _has_complete_card_metadata(metadata):
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "🖼️ Necesito imagen",
+                    callback_data=f"need_image:{card_token}",
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(rows)
+
+
+def _card_keyboard(card_token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🔄 Otra foto", callback_data=f"otra_foto:{card_token}"),
+                InlineKeyboardButton("🎨 Sin foto", callback_data=f"sin_foto:{card_token}"),
+            ]
+        ]
+    )
 
 
 def describe_poster_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> str:
@@ -260,7 +428,7 @@ async def generate_and_show_draft(
     await status_msg.edit_text("⏳ Generando copy…")
 
     try:
-        draft, tone = await generate_copy(press_release)
+        draft, tone, card_metadata = await generate_copy(press_release)
     except Exception as exc:
         if is_document_too_long_error(exc):
             logger.warning("Documento demasiado largo para Groq (413): %s", exc)
@@ -276,6 +444,7 @@ async def generate_and_show_draft(
 
     context.user_data["current_draft"] = draft
     context.user_data["current_tone"] = tone
+    card_token = _store_card_metadata(context, card_metadata)
 
     message = (
         f"📝 <b>Borrador de copy:</b>\n"
@@ -287,7 +456,7 @@ async def generate_and_show_draft(
 
     await status_msg.edit_text(
         message,
-        reply_markup=DRAFT_KEYBOARD,
+        reply_markup=_draft_keyboard(card_token, card_metadata),
         parse_mode="HTML",
     )
 
@@ -540,11 +709,107 @@ async def handle_unsupported_command(update: Update, context: ContextTypes.DEFAU
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles the approve / regenerate / discard inline button callbacks."""
+    """Handles draft and generated-card inline button callbacks."""
     query = update.callback_query
-    await query.answer()
+    if query is None:
+        return
+    callback_data = query.data or ""
+    action, _, card_token = callback_data.partition(":")
 
-    action = query.data
+    if action in {"need_image", "otra_foto", "sin_foto"}:
+        card_metadata = _get_card_metadata(context, card_token)
+        if card_metadata is None:
+            await query.answer(
+                "Esta noticia es anterior al último reinicio, vuelve a enviarla",
+                show_alert=True,
+            )
+            return
+
+        if action == "otra_foto":
+            await query.answer(
+                "Aún no hay un archivo de fotos disponible.",
+                show_alert=True,
+            )
+            return
+
+        if action == "sin_foto":
+            if query.message is None:
+                await query.answer(
+                    "No puedo modificar este mensaje.",
+                    show_alert=True,
+                )
+                return
+            await query.answer("Tarjeta confirmada sin foto.")
+            await query.edit_message_reply_markup(reply_markup=None)
+            records = context.user_data.get("card_metadata")
+            if isinstance(records, dict):
+                records.pop(card_token, None)
+            return
+
+        if query.message is None:
+            await query.answer(
+                "No puedo enviar la tarjeta desde este mensaje.",
+                show_alert=True,
+            )
+            return
+
+        if not _has_complete_card_metadata(card_metadata):
+            await query.answer(
+                "No hay datos válidos para crear la tarjeta de esta noticia.",
+                show_alert=True,
+            )
+            return
+
+        titular = card_metadata.get("titular")
+        resaltado = card_metadata.get("resaltado")
+        subtitulo = card_metadata.get("subtitulo")
+        categoria = card_metadata.get("categoria")
+        if not all(
+            isinstance(value, str) and value.strip()
+            for value in (titular, resaltado, subtitulo, categoria)
+        ):
+            await query.answer(
+                "El copy está disponible, pero faltan datos válidos para crear la tarjeta.",
+                show_alert=True,
+            )
+            return
+
+        await query.answer()
+        try:
+            image_bytes = await asyncio.to_thread(
+                generar_tarjeta,
+                titular,
+                resaltado,
+                subtitulo,
+                categoria,
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            logger.error("No se pudo generar la tarjeta: %s", exc)
+            await context.bot.send_message(
+                chat_id=query.message.chat.id,
+                text="❌ No se pudo generar la tarjeta. Inténtalo de nuevo más tarde.",
+            )
+            return
+
+        await context.bot.send_photo(
+            chat_id=query.message.chat.id,
+            photo=InputFile(BytesIO(image_bytes), filename="tarjeta.png"),
+            reply_markup=_card_keyboard(card_token),
+        )
+        return
+
+    press_release_to_regenerate = ""
+    if action == "regenerate":
+        saved_press_release = context.user_data.get("press_release")
+        if not isinstance(saved_press_release, str) or not saved_press_release:
+            await query.answer(
+                "No encontré la nota original. Vuélvela a pegar en el chat.",
+                show_alert=True,
+            )
+            return
+        press_release_to_regenerate = saved_press_release
+
+    await query.answer()
 
     if action == "approve":
         draft = context.user_data.get("current_draft", "")
@@ -557,20 +822,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
 
     elif action == "regenerate":
-        press_release = context.user_data.get("press_release")
-        if not press_release:
-            await query.answer(
-                "No encontré la nota original. Vuélvela a pegar en el chat.",
-                show_alert=True,
-            )
-            return
-
         # Remove buttons while generating to prevent double-taps
         await query.edit_message_text("⏳ Regenerando copy…")
 
         try:
             # Slightly higher temperature so the new draft varies from the previous one
-            draft, tone = await generate_copy(press_release, temperature=0.9)
+            draft, tone, card_metadata = await generate_copy(
+                press_release_to_regenerate, temperature=0.9
+            )
         except Exception as exc:
             if is_document_too_long_error(exc):
                 logger.warning("Documento demasiado largo para Groq (413): %s", exc)
@@ -584,12 +843,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         context.user_data["current_draft"] = draft
         context.user_data["current_tone"] = tone
+        card_token = _store_card_metadata(context, card_metadata)
 
         await query.edit_message_text(
             f"📝 <b>Borrador de copy:</b>\n"
             f"Tono detectado: <b>{TONE_DISPLAY[tone]}</b>\n\n"
             f"<pre>{html.escape(draft)}</pre>",
-            reply_markup=DRAFT_KEYBOARD,
+            reply_markup=_draft_keyboard(card_token, card_metadata),
             parse_mode="HTML",
         )
 
