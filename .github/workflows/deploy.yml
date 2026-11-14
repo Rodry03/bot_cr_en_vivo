@@ -24,9 +24,33 @@ jobs:
       - name: Check bot.py compiles
         run: python -m py_compile bot.py
 
+  test:
+    name: Tests (unittest)
+    runs-on: ubuntu-latest
+    env:
+      # Los tests no deben tocar servicios reales: todo lo que llama a Groq/Gemini
+      # está mockeado. Un test que necesite claves o red debe saltarse
+      # (unittest.skipUnless) cuando la variable no exista, no fallar.
+      CI: "true"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+
   build-and-push:
     name: Build & push Docker image
-    needs: ci
+    needs: [ci, test]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -52,7 +76,7 @@ jobs:
 
   deploy:
     name: Deploy to GCP VM
-    needs: build-and-push
+    needs: [test, build-and-push]
     runs-on: ubuntu-latest
     steps:
       - name: Deploy over SSH
