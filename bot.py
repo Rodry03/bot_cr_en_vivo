@@ -37,6 +37,13 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+# httpx registra a nivel INFO cada petición con su URL completa, y las de Telegram
+# llevan el token del bot (https://api.telegram.org/bot<TOKEN>/...). Se suben a
+# WARNING para que el token no acabe en `docker logs`. httpcore solo escribe en
+# DEBUG, pero se fija igual por si alguien baja el nivel global.
+QUIET_HTTP_LOGGERS = ("httpx", "httpcore")
+for _http_logger in QUIET_HTTP_LOGGERS:
+    logging.getLogger(_http_logger).setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
