@@ -19,3 +19,11 @@ __pycache__/
 Thumbs.db
 gh-deploy-key
 gh-deploy-key.pub
+
+# Imágenes de prueba locales
+prueba-*
+resultado-*
+
+# Fotos del archivo: viven solo en la VM (/home/deploy/bot-cr-archivo); el índice sí se versiona
+archivo/*.jpg
+archivo/*.jpeg

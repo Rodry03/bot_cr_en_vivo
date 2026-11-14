@@ -306,6 +306,8 @@ def _store_card_metadata(
     metadata: CardMetadata,
     pdf_path: str | None = None,
     press_release: str = "",
+    draft: str = "",
+    tone: str = DEFAULT_TONE,
 ) -> str:
     card_token = secrets.token_hex(8)
     records = context.user_data.get("card_metadata")
@@ -314,6 +316,8 @@ def _store_card_metadata(
         context.user_data["card_metadata"] = records
     record = dict(metadata)
     record["_press_release"] = press_release
+    record["_draft"] = draft
+    record["_tone"] = tone
     if pdf_path:
         record["_pdf_path"] = pdf_path
     else:
@@ -391,9 +395,6 @@ def _delete_card_metadata(context: ContextTypes.DEFAULT_TYPE, card_token: str) -
         record = records.pop(card_token, None)
         if isinstance(record, dict):
             _cleanup_card_assets(record)
-    if context.user_data.get("current_card_token") == card_token:
-        context.user_data["current_card_token"] = None
-        context.user_data["current_pdf_path"] = None
 
 
 def _get_pdf_temp_dir(context: ContextTypes.DEFAULT_TYPE) -> Path:
@@ -602,9 +603,10 @@ async def generate_and_show_draft(
     notice: str = "",
     pdf_path: str | None = None,
 ) -> None:
-    """Generates a copy from the press release text and shows it with the approve/regenerate/discard buttons."""
-    context.user_data["press_release"] = press_release
+    """Generates a copy from the press release text and shows it with the approve/regenerate/discard buttons.
 
+    El borrador, el tono y la nota se guardan en el registro del token de esta noticia,
+    para que los botones de cada mensaje actúen sobre su propia noticia."""
     await status_msg.edit_text("⏳ Generando copy…")
 
     try:
@@ -624,16 +626,14 @@ async def generate_and_show_draft(
         )
         return
 
-    context.user_data["current_draft"] = draft
-    context.user_data["current_tone"] = tone
     card_token = _store_card_metadata(
         context,
         _empty_card_metadata(),
         pdf_path,
         press_release=press_release,
+        draft=draft,
+        tone=tone,
     )
-    context.user_data["current_card_token"] = card_token
-    context.user_data["current_pdf_path"] = pdf_path
 
     message = (
         f"📝 <b>Borrador de copy:</b>\n"
@@ -991,7 +991,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                         chat_id=query.message.chat.id,
                         text="❌ No se pudo generar la tarjeta sin foto.",
                     )
-            _delete_card_metadata(context, card_token)
+            # Solo se limpian los temporales de la tarjeta: el registro se conserva
+            # para que Aprobar/Regenerar del borrador sigan funcionando.
+            _cleanup_card_assets(card_metadata)
+            card_metadata["_pdf_path"] = None
+            card_metadata["_pdf_images"] = []
             return
 
         if query.message is None:
@@ -1100,8 +1104,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             finally:
                 _remove_local_file(pdf_path)
                 card_metadata["_pdf_path"] = None
-                if context.user_data.get("current_pdf_path") == pdf_path:
-                    context.user_data["current_pdf_path"] = None
             pdf_images = [str(path) for path in extracted_paths]
             card_metadata["_pdf_images"] = pdf_images
 
@@ -1138,33 +1140,55 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
         return
 
-    press_release_to_regenerate = ""
-    if action == "regenerate":
-        saved_press_release = context.user_data.get("press_release")
-        if not isinstance(saved_press_release, str) or not saved_press_release:
+    if action == "discard":
+        await query.answer()
+        await query.message.delete()
+        _delete_card_metadata(context, card_token)
+        return
+
+    if action not in {"approve", "regenerate"}:
+        await query.answer()
+        return
+
+    record = _get_card_metadata(context, card_token)
+    if record is None:
+        await query.answer(
+            "Esta noticia es anterior al último reinicio, vuelve a enviarla",
+            show_alert=True,
+        )
+        return
+
+    if action == "approve":
+        draft = record.get("_draft")
+        if not isinstance(draft, str) or not draft:
             await query.answer(
-                "No encontré la nota original. Vuélvela a pegar en el chat.",
+                "No encontré el borrador de esta noticia. Vuelve a enviarla.",
                 show_alert=True,
             )
             return
-        press_release_to_regenerate = saved_press_release
-
-    await query.answer()
-
-    if action == "approve":
-        draft = context.user_data.get("current_draft", "")
-        tone = context.user_data.get("current_tone", DEFAULT_TONE)
+        tone = record.get("_tone")
+        if tone not in ALLOWED_TONES:
+            tone = DEFAULT_TONE
+        await query.answer()
         await query.edit_message_text(
             f"✅ <b>Copy aprobado</b>\n"
             f"Tono detectado: <b>{TONE_DISPLAY[tone]}</b>\n\n"
             f"<pre>{html.escape(draft)}</pre>",
             parse_mode="HTML",
         )
-        target_token = card_token or context.user_data.get("current_card_token")
-        if isinstance(target_token, str):
-            _delete_card_metadata(context, target_token)
+        _delete_card_metadata(context, card_token)
+        return
 
-    elif action == "regenerate":
+    press_release_to_regenerate = record.get("_press_release")
+    if not isinstance(press_release_to_regenerate, str) or not press_release_to_regenerate:
+        await query.answer(
+            "No encontré la nota original. Vuélvela a pegar en el chat.",
+            show_alert=True,
+        )
+        return
+    await query.answer()
+
+    if action == "regenerate":
         # Remove buttons while generating to prevent double-taps
         await query.edit_message_text("⏳ Regenerando copy…")
 
@@ -1184,30 +1208,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
             return
 
-        pdf_path = context.user_data.get("current_pdf_path")
-        previous_token = context.user_data.get("current_card_token")
-        previous_record = (
-            _get_card_metadata(context, previous_token)
-            if isinstance(previous_token, str)
-            else None
-        )
-        if (
-            previous_record is not None
-            and previous_record.get("_pdf_path") == pdf_path
-        ):
-            previous_record["_pdf_path"] = None
-        context.user_data["current_draft"] = draft
-        context.user_data["current_tone"] = tone
-        card_token = _store_card_metadata(
-            context,
-            _empty_card_metadata(),
-            pdf_path if isinstance(pdf_path, str) else None,
-            press_release=press_release_to_regenerate,
-        )
-        context.user_data["current_card_token"] = card_token
-        context.user_data["current_pdf_path"] = (
-            pdf_path if isinstance(pdf_path, str) else None
-        )
+        # Misma noticia, mismo token: se actualiza su borrador y se conservan la nota,
+        # el PDF y los datos de tarjeta (dependen de la nota, no del copy).
+        record["_draft"] = draft
+        record["_tone"] = tone
 
         await query.edit_message_text(
             f"📝 <b>Borrador de copy:</b>\n"
@@ -1216,12 +1220,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             reply_markup=_draft_keyboard(card_token),
             parse_mode="HTML",
         )
-
-    elif action == "discard":
-        await query.message.delete()
-        target_token = card_token or context.user_data.get("current_card_token")
-        if isinstance(target_token, str):
-            _delete_card_metadata(context, target_token)
 
 
 def setup_langfuse_tracing() -> None:
