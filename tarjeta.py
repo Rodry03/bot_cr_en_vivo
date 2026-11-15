@@ -368,7 +368,13 @@ def _envolver_equilibrado(
     return mejor
 
 
-def _ajustar_titular(texto: str, ancho: int) -> tuple[ImageFont.FreeTypeFont, list[tuple[int, int]], int]:
+def _buscar_ajuste_titular(
+    texto: str, ancho: int
+) -> tuple[ImageFont.FreeTypeFont, list[tuple[int, int]], int] | None:
+    """Busca tamaño y cortes para que el titular quepa en 1, 2 o 3 líneas.
+
+    Devuelve None si ni con el tamaño mínimo cabe en 3 líneas.
+    """
     fuente_inicial = _fuente(800, 92)
     lineas_iniciales = _envolver(texto, fuente_inicial, ancho)
     if len(lineas_iniciales) <= 1:
@@ -389,8 +395,21 @@ def _ajustar_titular(texto: str, ancho: int) -> tuple[ImageFont.FreeTypeFont, li
             ascenso, descenso = fuente.getmetrics()
             return fuente, lineas, round((ascenso + descenso) * 1.02)
 
+    return None
+
+
+def titular_cabe(titular: str) -> bool:
+    """True si el titular entero cabe en un máximo de 3 líneas de la tarjeta."""
+    return _buscar_ajuste_titular(titular, ANCHO - 128) is not None
+
+
+def _ajustar_titular(texto: str, ancho: int) -> tuple[ImageFont.FreeTypeFont, list[tuple[int, int]], int]:
+    ajuste = _buscar_ajuste_titular(texto, ancho)
+    if ajuste is not None:
+        return ajuste
+    fuente_inicial = _fuente(800, 92)
     ascenso, descenso = fuente_inicial.getmetrics()
-    return fuente_inicial, lineas_iniciales, round((ascenso + descenso) * 1.02)
+    return fuente_inicial, _envolver(texto, fuente_inicial, ancho), round((ascenso + descenso) * 1.02)
 
 
 def _dibujar_titular(

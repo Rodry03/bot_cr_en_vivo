@@ -43,6 +43,50 @@ class CardMetadataTests(unittest.TestCase):
         self.assertEqual(metadata["subtitulo"], "Las obras del canal del río Águeda ya han empezado.")
         self.assertLessEqual(len(metadata["subtitulo"].split()), 15)
 
+    def test_long_title_is_kept_whole_and_subtitle_quotes_are_tolerated(self) -> None:
+        note = (
+            "Entre los galardones entregados, «La sospecha de Sofía», de Imanol Uribe, "
+            "ha conseguido el premio a mejor largometraje, mejor montaje y otros."
+        )
+        data = {
+            "titular": "Premios, cine y música en la clausura del 15º FICCI-ON de Ciudad Rodrigo",
+            "resaltado": "FICCI-ON",
+            "subtitulo": '"La sospecha de Sofía", de Imanol Uribe, ha conseguido el premio a mejor largometraje',
+            "categoria": "CULTURA",
+            "lugar": None,
+        }
+
+        metadata = bot._parse_card_metadata(data, note)
+
+        self.assertEqual(metadata["titular"], data["titular"])
+        self.assertEqual(metadata["subtitulo"], data["subtitulo"])
+
+    def test_condensed_subtitle_is_accepted_only_if_its_facts_are_in_the_note(self) -> None:
+        note = (
+            "Durante la gala se han entregado un total de 15 premios, en una edición en la que "
+            "han destacado especialmente el cortometraje «Sí se enteran», de Beltrán Peralba, "
+            "y el largometraje «La sospecha de Sofía», de Imanol Uribe."
+        )
+        base = {
+            "titular": "Premios en la clausura del 15º FICCI-ON",
+            "resaltado": "FICCI-ON",
+            "categoria": "CULTURA",
+            "lugar": None,
+        }
+        good = "Se entregaron 15 premios, destacando el cortometraje «Sí se enteran» y el largometraje «La sospecha de Sofía»"
+        invented_name = "Se entregaron 15 premios, destacando el largometraje «El hoyo» de Imanol Uribe"
+        invented_number = "Se entregaron 20 premios, destacando el largometraje «La sospecha de Sofía»"
+
+        self.assertEqual(bot._parse_card_metadata({**base, "subtitulo": good}, note)["subtitulo"], good)
+        for bad in (invented_name, invented_number):
+            self.assertNotEqual(bot._parse_card_metadata({**base, "subtitulo": bad}, note)["subtitulo"], bad)
+
+    def test_title_fit_check_allows_three_lines_only(self) -> None:
+        from tarjeta import titular_cabe
+
+        self.assertTrue(titular_cabe("Premios, cine y música en la clausura del 15º FICCI-ON"))
+        self.assertFalse(titular_cabe(" ".join(["Supercalifragilístico"] * 12)))
+
     def test_card_image_is_encoded_as_jpeg(self) -> None:
         metadata = {
             "titular": "Limpieza del canal del río Águeda",

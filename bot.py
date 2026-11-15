@@ -29,7 +29,7 @@ from telegram.ext import (
 from PIL import Image
 
 from archivo_fotos import LUGARES, extraer_imagenes_pdf, fotos_para_lugar
-from tarjeta import CATEGORIAS, generar_tarjeta
+from tarjeta import CATEGORIAS, generar_tarjeta, titular_cabe
 
 load_dotenv()
 
@@ -112,9 +112,9 @@ DOCUMENT_TOO_LONG_MESSAGE = (
 
 CARD_METADATA_INSTRUCTIONS = """Extrae metadatos para una tarjeta de noticias. No redactes el copy ni detectes el tono.
 Devuelve únicamente un objeto JSON válido con exactamente estas cinco claves:
-- "titular": titular fiel a la nota, con un máximo de 8 palabras.
+- "titular": titular fiel a la nota, con un máximo de 10 palabras.
 - "resaltado": el lugar, entidad o elemento concreto más reconocible que aparezca literalmente en el titular (por ejemplo, "río Águeda", "Plaza Mayor" o "Carnaval del Toro"). Nunca elijas un verbo ni una palabra genérica como "Limpieza", "Nueva" u "Obras". Si no hay un elemento concreto, elige la palabra de mayor peso informativo. Copia exactamente su escritura del titular.
-- "subtitulo": fragmento literal de la nota, sin reescribir ni añadir información, con un máximo de 15 palabras.
+- "subtitulo": frase sacada de la nota, preferiblemente literal o casi literal, sin añadir información ni nombres que no aparezcan en ella, con un máximo de 20 palabras. Tiene que leerse como una frase completa que incluya el dato principal de la noticia (quién y qué: los nombres propios, obras o protagonistas clave); nunca lo cortes antes de llegar a lo importante. Complementa al titular sin repetirlo: no vuelvas a decir lo que el titular ya cuenta, aporta el dato clave que falta. No repitas palabras del titular ni dentro del propio subtítulo (por ejemplo, no 'el largometraje… ganó mejor largometraje'). En una entrega de premios, el dato principal es quién gana el premio más importante (por ejemplo, la película ganadora del premio a mejor largometraje), no el número de premios. Elige el fragmento que mejor resuma la noticia, aunque no sea la primera frase.
 - "categoria": elige exactamente una categoría de esta lista y aplica estas definiciones:
   - MEDIO AMBIENTE: ríos, naturaleza, limpiezas, residuos, zonas verdes o animales.
   - OBRAS: construcción, reformas, asfaltado o cortes de calles causados por obras.
@@ -147,40 +147,74 @@ def _empty_card_metadata() -> CardMetadata:
     }
 
 
+MAX_CARD_TITLE_WORDS = 10
+MAX_CARD_SUBTITLE_WORDS = 20
+# "Máximo unas 20 palabras": se toleran un par más antes de descartar el subtítulo.
+CARD_SUBTITLE_WORD_TOLERANCE = 22
+
+_QUOTES_RE = re.compile(r"[«»“”„\"‘’']")
+
+
 def _normalized_text(text: str) -> str:
-    return " ".join(text.casefold().split())
+    return " ".join(_QUOTES_RE.sub('"', text).casefold().split())
+
+
+def _subtitle_facts_in_note(subtitle: str, press_release: str) -> bool:
+    """True si los datos comprobables del subtítulo están en la nota.
+
+    Se aceptan subtítulos ligeramente condensados (Groq tiende a resumir la frase),
+    pero solo si cada título entre comillas, número y nombre propio que mencionan
+    aparece tal cual en la nota: así no se cuela información inventada.
+    """
+    note = _normalized_text(press_release)
+    normalized = _QUOTES_RE.sub('"', subtitle)
+    facts = re.findall(r'"([^"]+)"', normalized)
+    without_quotes = re.sub(r'"[^"]*"', " ", normalized)
+    facts += re.findall(r"\d+\S*", without_quotes)
+    words = without_quotes.split()
+    # La primera palabra va en mayúscula por ser inicio de frase, no por ser nombre propio.
+    facts += [w.strip(".,;:()¡!¿?") for w in words[1:] if w[:1].isupper()]
+    if not all(_normalized_text(fact) in note for fact in facts if fact.strip()):
+        return False
+
+    # Además, casi todo el vocabulario tiene que salir de la nota (comparando raíces de
+    # 5 letras para admitir "entregaron" ↔ "entregado"); frena afirmaciones inventadas
+    # sin nombres propios, tipo "El canal ya está limpio".
+    def stems(text: str) -> list[str]:
+        return [w[:5] for w in re.findall(r"\w+", text.casefold()) if len(w) > 3]
+
+    note_stems = set(stems(press_release))
+    subtitle_stems = stems(subtitle)
+    if not subtitle_stems:
+        return False
+    found = sum(stem in note_stems for stem in subtitle_stems)
+    return found / len(subtitle_stems) >= 0.75
 
 
 def _literal_subtitle_from_note(press_release: str) -> str | None:
-    first_sentence = re.split(r"(?<=[.!?])\s+", press_release.strip(), maxsplit=1)[0]
-    words = list(re.finditer(r"\S+", first_sentence))
-    if not words:
+    """Fallback: la primera frase de la nota que quepa entera en el límite.
+
+    Si ninguna cabe, corta la primera frase en la última coma dentro del límite
+    (para que al menos termine en una pausa natural) y, en último caso, por palabras.
+    """
+    sentences = [
+        s.strip()
+        for s in re.split(r"(?<=[.!?])\s+", press_release.strip())
+        if s.strip()
+    ]
+    if not sentences:
         return None
-    return first_sentence[: words[min(len(words), 15) - 1].end()]
+    for sentence in sentences:
+        if len(sentence.split()) <= CARD_SUBTITLE_WORD_TOLERANCE:
+            return sentence
 
-
-def _trim_card_title(titular: str, resaltado: str | None) -> str:
-    palabras = list(re.finditer(r"\S+", titular))
-    if len(palabras) <= 8:
-        return titular
-
-    inicio = 0
-    coincidencia = re.search(re.escape(resaltado), titular) if resaltado else None
-    if coincidencia:
-        indices_resaltados = [
-            indice
-            for indice, palabra in enumerate(palabras)
-            if palabra.start() < coincidencia.end() and coincidencia.start() < palabra.end()
-        ]
-        if indices_resaltados and indices_resaltados[-1] >= 8:
-            primero, ultimo = indices_resaltados[0], indices_resaltados[-1]
-            palabras_resaltadas = ultimo - primero + 1
-            inicio = max(0, primero - (8 - palabras_resaltadas) // 2)
-            inicio = min(inicio, len(palabras) - 8, primero)
-            if inicio + 8 <= ultimo:
-                inicio = ultimo - 7
-
-    return titular[palabras[inicio].start() : palabras[inicio + 7].end()]
+    first_sentence = sentences[0]
+    words = list(re.finditer(r"\S+", first_sentence))
+    limit_end = words[MAX_CARD_SUBTITLE_WORDS - 1].end()
+    comma = first_sentence.rfind(",", 0, limit_end)
+    if comma > 0 and len(first_sentence[:comma].split()) >= 6:
+        return first_sentence[:comma]
+    return first_sentence[:limit_end]
 
 
 def _parse_card_metadata(data: dict[str, object], press_release: str) -> CardMetadata:
@@ -190,11 +224,8 @@ def _parse_card_metadata(data: dict[str, object], press_release: str) -> CardMet
     resaltado = data.get("resaltado")
     resaltado_texto = resaltado.strip() if isinstance(resaltado, str) else None
     if isinstance(titular, str) and titular.strip():
-        titular_texto = titular.strip()
-        if len(titular_texto.split()) > 8:
-            titular_texto = _trim_card_title(titular_texto, resaltado_texto)
-            logger.warning("Titular de tarjeta recortado al máximo de 8 palabras.")
-        metadata["titular"] = titular_texto
+        # El titular nunca se recorta: si es largo, generate_card_metadata() decide.
+        metadata["titular"] = " ".join(titular.split())
     else:
         logger.warning("Groq devolvió un titular de tarjeta ausente o inválido.")
 
@@ -211,13 +242,16 @@ def _parse_card_metadata(data: dict[str, object], press_release: str) -> CardMet
     if (
         isinstance(subtitulo, str)
         and subtitulo.strip()
-        and len(subtitulo.split()) <= 15
-        and _normalized_text(subtitulo) in _normalized_text(press_release)
+        and len(subtitulo.split()) <= CARD_SUBTITLE_WORD_TOLERANCE
+        and (
+            _normalized_text(subtitulo) in _normalized_text(press_release)
+            or _subtitle_facts_in_note(subtitulo, press_release)
+        )
     ):
         metadata["subtitulo"] = subtitulo.strip()
     else:
         metadata["subtitulo"] = _literal_subtitle_from_note(press_release)
-        logger.warning("Groq devolvió un subtítulo no literal; uso un fragmento de la nota.")
+        logger.warning("Groq devolvió un subtítulo largo o con datos que no están en la nota; uso un fragmento de la nota.")
 
     categoria = data.get("categoria")
     if isinstance(categoria, str) and categoria.strip().upper() in CATEGORIAS:
@@ -232,6 +266,22 @@ def _parse_card_metadata(data: dict[str, object], press_release: str) -> CardMet
         logger.warning("Groq devolvió un lugar que no está en la lista cerrada; se ignora.")
 
     return metadata
+
+
+def _ensure_blank_line_before_hashtags(copy_text: str) -> str:
+    """Garantiza exactamente una línea en blanco antes de la línea de hashtags.
+
+    La línea de hashtags es la última línea no vacía si todas sus palabras empiezan
+    por '#'. Si no la hay, el copy se devuelve igual.
+    """
+    lines = copy_text.rstrip().split("\n")
+    last = lines[-1].strip() if lines else ""
+    if not last or not all(word.startswith("#") for word in last.split()):
+        return copy_text
+    body = "\n".join(lines[:-1]).rstrip()
+    if not body:
+        return copy_text
+    return f"{body}\n\n{last}"
 
 
 async def generate_copy(
@@ -262,6 +312,7 @@ async def generate_copy(
         copy_text = str(data["copy"]).strip()
         if not copy_text:
             raise ValueError("la clave 'copy' del JSON viene vacía")
+        copy_text = _ensure_blank_line_before_hashtags(copy_text)
         tone = str(data.get("tono", "")).strip().lower()
         if tone not in ALLOWED_TONES:
             tone = DEFAULT_TONE
@@ -274,15 +325,12 @@ async def generate_copy(
         return raw, DEFAULT_TONE
 
 
-async def generate_card_metadata(press_release: str) -> CardMetadata:
-    """Generates only the five fields needed to render a news card."""
-    client = AsyncGroq(api_key=os.environ["GROQ_API_KEY"])
+async def _request_card_metadata(
+    client: AsyncGroq, messages: list[dict[str, str]], press_release: str
+) -> tuple[CardMetadata, str]:
     response = await client.chat.completions.create(
         model=GROQ_MODEL,
-        messages=[
-            {"role": "system", "content": CARD_METADATA_INSTRUCTIONS},
-            {"role": "user", "content": press_release},
-        ],
+        messages=messages,
         temperature=0.3,
         max_tokens=1024,
         reasoning_effort="low",
@@ -305,7 +353,62 @@ async def generate_card_metadata(press_release: str) -> CardMetadata:
     metadata = _parse_card_metadata(data, press_release)
     if not _has_complete_card_metadata(metadata):
         raise ValueError("Groq no devolvió datos suficientes para crear la tarjeta.")
-    return metadata
+    return metadata, raw
+
+
+def _title_word_count(metadata: CardMetadata) -> int:
+    return len(str(metadata["titular"]).split())
+
+
+async def generate_card_metadata(press_release: str) -> CardMetadata:
+    """Generates only the five fields needed to render a news card.
+
+    El titular nunca se recorta. Si pasa de MAX_CARD_TITLE_WORDS, se repite la
+    llamada una vez pidiendo uno más corto; si sigue siendo largo, se usa entero
+    siempre que quepa en 3 líneas de la tarjeta.
+    """
+    client = AsyncGroq(api_key=os.environ["GROQ_API_KEY"])
+    messages = [
+        {"role": "system", "content": CARD_METADATA_INSTRUCTIONS},
+        {"role": "user", "content": press_release},
+    ]
+    metadata, raw = await _request_card_metadata(client, messages, press_release)
+    words = _title_word_count(metadata)
+    if words <= MAX_CARD_TITLE_WORDS:
+        return metadata
+
+    logger.warning(
+        "Titular de tarjeta con %d palabras (máximo %d); pido uno más corto.",
+        words,
+        MAX_CARD_TITLE_WORDS,
+    )
+    candidates = [metadata]
+    retry_messages = messages + [
+        {"role": "assistant", "content": raw},
+        {
+            "role": "user",
+            "content": (
+                f"El titular tiene {words} palabras y el máximo es {MAX_CARD_TITLE_WORDS}. "
+                f"Escribe un titular más corto, de {MAX_CARD_TITLE_WORDS} palabras como mucho, "
+                "que siga siendo fiel a la nota y mantenga lo más importante. Ajusta el "
+                "resaltado para que aparezca literalmente en el nuevo titular. Devuelve de "
+                "nuevo el JSON completo con las cinco claves."
+            ),
+        },
+    ]
+    try:
+        retry_metadata, _ = await _request_card_metadata(client, retry_messages, press_release)
+        if _title_word_count(retry_metadata) <= MAX_CARD_TITLE_WORDS:
+            return retry_metadata
+        candidates.insert(0, retry_metadata)
+    except (GroqError, ValueError) as exc:
+        logger.warning("Falló el reintento del titular de tarjeta: %s", exc)
+
+    for candidate in candidates:
+        if titular_cabe(str(candidate["titular"])):
+            logger.info("Uso el titular largo entero porque cabe en 3 líneas.")
+            return candidate
+    raise ValueError("El titular de la tarjeta no cabe en 3 líneas ni tras reintentar.")
 
 
 def _store_card_metadata(
